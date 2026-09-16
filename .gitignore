@@ -1,0 +1,6 @@
+# Build artifacts and local state, none of which belong in source control.
+*.zip
+*.log
+MinimapConfig.ini
+TTSConfig.ini
+ModUIConfig.ini

@@ -1,0 +1,29 @@
+MortalShell2TTS changelog (newest first)
+
+v0.9.263 (2026-09-16)
+  Removed a per-row reset that didn't work. Holding R or L3 on a row was
+  supposed to put that one row back to its default, and testing before release
+  showed it does nothing, so the line that promised it is gone from the
+  settings window and this file. Use the reset row at the bottom of each tab.
+  No other change.
+
+v0.9.262 (2026-09-14)
+  Settings window rebuilt on MortalShell2ModUI 0.70+. Rows are grouped under
+  section titles inside each tab instead of one long list, and the window
+  sizes itself to the longest label so nothing gets clipped.
+  New "Debug logging" toggle on the MOD tab, off by default. Leave it off:
+  startup, session and failure events are logged either way. Turn it on before
+  reproducing a bug so the log has the detail.
+  "Log performance" on the MOD tab, also off by default, writes a timing
+  summary to UE4SS.log every 10 seconds if you want to see what the mod costs.
+
+v0.9.261 (2026-09-13)
+  Performance logging reworked so it costs nothing while it's switched off.
+
+v0.9.260 and earlier
+  Development history. The mod was built and rewritten a lot before this point
+  and the notes from that are not much use to anyone but me, so they're not
+  shipped. The short version: Windows voices, then the Azure neural voices,
+  then the voice browser with search and favorites, the pronunciation
+  dictionary, speech queue modes, per-page reading, controller support, and
+  the move to a shared settings window.

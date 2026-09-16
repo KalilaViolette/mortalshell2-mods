@@ -1,0 +1,266 @@
+MortalShell2ModUI changelog (newest first)
+
+v0.71.1 / API 2 (2026-09-14)
+  Section headers are drawn with a real em dash either side of the title
+  instead of two hyphens. The glyph was proven in the game's ReadText style
+  (Crimson Italic) by a UI playground screenshot before it was adopted. No API
+  change. (This file stays plain ASCII, so the character is described rather
+  than shown.)
+
+v0.71.0 / API 2 (2026-09-14)
+  Section headers inside a settings tab. A mod marks a row "header" (rowKinds)
+  and sends its title as the label. The window draws it as a divider line in
+  capitals (-- TITLE --) with nothing in the value column, so related rows read
+  as a group without needing a tab each. The mod keeps the row unselectable, and
+  the host lays it out like any other row, so scrolling and mouse hits are
+  unchanged. Additive: a mod that sends no header rows draws exactly as before.
+
+v0.70.3 / API 2 (2026-09-14)
+  The wide "browser" layout, which is the shared Controller Settings screen
+  (calibration, live test) and TTS's voice browser, sizes its columns from the
+  text the same way the settings window does, with the details panel, the
+  mouse map and the smoke backdrop following. Its tuned layout is the floor,
+  so nothing that fit before moves.
+
+v0.70.2 / API 2 (2026-09-14)
+  The label / value columns follow the tab on show, both ways: a narrower tab
+  gets its space back (0.70.1 had kept the widest width seen per open).
+
+v0.70.1 / API 2 (2026-09-14)
+  The smoke backdrop follows the prompt width: a widened window drew its text
+  past the smoke on both sides (the backdrop is a fixed 1920-unit box centered
+  in the prompt, and it is now scaled and re-centered from the prompt width,
+  with the tuned 2000-unit look preserved exactly). The columns were also made
+  to only grow while the window was open, which was reverted in 0.70.2.
+
+v0.70.0 / API 2 (2026-09-14)
+  Settings window layout: the label and value columns are sized from the
+  text the window actually drew (measured after the first layout pass), so
+  long labels and values no longer clip or run into the details panel. The
+  tab strip is left-justified and windowed inside the window's width, with
+  "<" / ">" marks to scroll it, instead of one centered string that spilled
+  off the screen. Mouse hits are resolved by the host against the strip and
+  columns it drew and sent with the click, so a click lands on the word it
+  is over. Hold-to-reset: R (keyboard) or L3 (controller) held 5 s on a row
+  publishes "reset-row" to the mod, which resets that row only. The
+  Controller Settings screen (thresholds, calibration, live test) is now a
+  shared component any mod opens from its own row
+  (ConsumerClient.ControllerSettings + Controller.Settings.Presentation).
+
+v0.69.1 / API 2 (2026-09-13)
+  The settings tab strip never squeezes a cell below the six-tab width. More
+  tabs grow the strip, drawn cells and pointer regions alike (the Minimap's
+  seventh tab, CAPTURE).
+
+v0.69.0 / API 2 (2026-09-13)
+  Performance logging (Core/Perf.lua, and the host follows the consumers'
+  logging flags) and a ten-row scrolling settings viewport, so a consumer tab
+  may hold more than ten rows.
+
+MortalShell2ModUI v0.68.4 / API 2
+
+v0.68.4 fixes nested native menus. Every game menu shares the
+WBP_Menu_Game_Tab UpdateOpenState(bool) hook, and v0.68.2-v0.68.3 treated any
+close as authoritative. Backing out of Level Up therefore released the gate
+while the beacon (LandingArea) menu was still open, and consumer overlays
+reappeared over it. The host now keys each UpdateOpenState call by the widget's
+address, read inside the live callback and never retained. The gate stays
+active while any game-tab widget is open, and closing the last one still
+releases every lease. The native menu log line adds openMenus=.
+
+v0.68.3 adds the performance-audit Candidate B read paths without changing
+settings ownership. Closed-menu consumers may read an eight-field primitive
+visibility snapshot instead of the full 70-field host metadata table. Open and
+closing settings sessions continue to use full metadata for session/lease/shell
+arbitration. Empty action drains now return before allocating normalization and
+dedupe tables; non-empty action semantics are unchanged.
+
+v0.68.2 corrects the native-menu gate using the returned runtime evidence and
+the exported game UI definitions. Broad UI-handler update/input events are not
+balanced menu lifecycle signals, while a bounded LandingArea lease expires even
+when the beacon menu is legitimately still open. The host now consumes the
+shared WBP_Menu_Game_Tab UpdateOpenState(bool) lifecycle as a primitive,
+authoritative open/close source. The exact LandingArea open callback remains an
+early transition guard; the shared close state clears it and begins the normal
+settle window. Consumer mods remain quarantined for the complete native-menu
+session without polling or retaining the game's menu widgets.
+
+v0.68.0 adds one host-owned native-menu lifecycle gate. The standalone host
+observes the game's shared UI-handler open/close functions and publishes only
+primitive state. Consumer mods can suspend world/widget work for the full menu
+transition without retaining or polling game UI objects.
+
+v0.67.1 is the target-runtime safety corrective. The experimental per-control
+WBP_Text construction is runtime-gated after it produced invisible controls and
+repeated package-load failures. The host again renders the stable native
+WBP_Setting_InfoPanel rich-text rails. It also no longer invokes the lore
+reader's forced-focus function on a borrowed prompt without the game's matching
+registration/removal lifecycle. The proven modal blockers, 225 ms close guard,
+single-step controller navigation, mouse targeting, reset confirmation, and
+shared input recorder remain active.
+
+v0.67 moves the remaining ordinary settings presentation and interaction policy
+into the shared library. Providers publish bounded primitive tab/row metadata;
+the one ModUI host owns their presentation. The per-control WBP_Text experiment
+is retained only as an audited, disabled adapter until a safe target-runtime
+lifecycle is proven. The host does not construct WBP_NB_Option because its
+Settings-dependent Construct graph previously crashed when borrowed by the lore
+shell.
+
+Settings.Interaction now owns A/D tab navigation, target-derived tab/row/value
+mouse hit zones, blank/detail no-op behavior, and two-step per-tab reset
+confirmation. Input.Route/ConsumerClient collapse native D-pad and mouse-wheel
+aliases into one semantic edge. Settings.CloseGuard supplies the shared 225 ms
+post-close protection window, alongside the proven explicit modal blockers and
+shared input ownership.
+
+Minimap is the first fully migrated ordinary provider. TTS publishes the same
+primitive metadata for its normal settings pages while retaining the Voice
+Browser as a specialty view.
+
+v0.66 adds a shared settings-provider binding-recorder facade. Consumers can
+request the same host-owned, on-demand keyboard/controller capture used by TTS
+through BindingCapture(), then read revision-bound samples with ReadBindingKey().
+Input.Capture now exposes the matching bounded key catalogs. No consumer adds a
+second physical input listener or broad idle scan.
+
+PASS 183 - BIG-PICTURE ARCHITECTURE AUDIT / SHARED MODAL POLICY + CONSUMER LIFECYCLE
+
+v0.65 keeps the shared one-window/modal architecture and corrects provider isolation. Every provider's keyboard/controller binding now opens only that provider, active modal ownership cannot be stolen by a second consumer, semantic navigation is deduplicated in the consumer facade, and tab hit regions follow the rendered tab strip.
+
+New consumers should use Host.ConsumerClient.BindSettingsProvider(...), BindControllerConsumer(...), or BindServiceConsumer(...) rather than relying on the compatibility defaults of bare Bind(...). minimum_api provides an early API compatibility gate. ConsumerClient.Shutdown() now retires controller/native/session/lease requests and removes the consumer from host discovery through Registry.RetireConsumer().
+
+Recommended future-mod pattern:
+  local client, err = ModUI.Host.ConsumerClient.BindSettingsProvider(ModUI, ModRef, {
+      consumer_id = "my-mod", display_name = "My Mod", version = "1.0.0", minimum_api = 2
+  })
+  if client ~= nil then client:Publish() end
+  -- Request shared controller samples only while the mod actually needs them:
+  -- client:ControllerInput(true) / client:ControllerInput(false)
+  -- On unload/retirement: client:Shutdown("mod-unload")
+
+Controller/gameplay-only mods should use BindControllerConsumer instead. Background consumers that need neither settings nor controller input should use BindServiceConsumer. Bare Bind remains compatibility-only so older consumers are not silently reclassified.
+
+The companion ARCHITECTURE_AUDIT_PASS183.txt records the remaining intentional alignment debt. Most importantly, the global menu-open bindings and Pause Game preference are still persisted through TTS even though they conceptually belong to shared ModUI policy. They are NOT migrated in this pass because their live ownership crosses the runtime-proven transition/capture/modal timing. Minimap must not duplicate them; migrate them through ModUI with target-game proof when that shared system-settings surface is implemented.
+
+Important remaining input-platform boundary: ConsumerClient does not yet expose arbitrary per-mod gameplay hotkey registration. The standalone host currently owns the shared menu-open hotkey plus shared native/controller feeds. If a future mod such as Minimap needs toggle/zoom/etc. hotkeys, extend Host.InputService/ConsumerClient as one shared registry/event path; do not create a second mod-local input listener or polling loop. Input.Conflict is reusable conflict logic but is not yet a cross-consumer hotkey directory.
+
+MortalShell2ModUI v0.63.0 / API 2 / Pass 182
+
+PASS 182 - SHARED CONTROLLER CONSUMER CONTRACT / API V2
+
+Controller.Profile is one shared persistent policy for MortalShell2ModUI and every registered consumer mod. Raw physical input is acquired once by the ModUI host without applying profile thresholds. Consumer mods should use Host.ConsumerClient rather than Runtime.ControllerAnalog directly:
+
+  client:ControllerInput(true)
+  client:ControllerAxis("Gamepad_RightY")
+  client:ControllerStick("left")
+  client:ControllerTrigger("Gamepad_LeftTriggerAxis", wasActive)
+
+ControllerAxis/ControllerStick/ControllerTrigger automatically reload and apply the current shared profile revision. Two-axis sticks use a radial deadzone; one-axis reads retain axial deadzone semantics; triggers use Trigger Activation/Release hysteresis and never inherit stick deadzone. ControllerInput is a non-capture 50 Hz feed and does not suppress the shared menu hotkey. Release it with ControllerInput(false) when a mod no longer needs continuous controller samples.
+
+Profile changes should go through ConsumerClient SaveControllerProfile/ResetControllerProfile (or Controller Settings, which publishes the same revision). Other Lua states detect the primitive ControllerProfileRevision commit marker and reload the shared persisted profile automatically. Descriptor revisions and host-epoch changes transparently reassert an already-active controller feed.
+
+There is intentionally no per-mod controller-profile override in Pass 182. Shared settings are the default for every consumer. If a future mod has a real need to override one setting, that override should be explicit and local to that mod rather than silently forking the global controller model. Runtime.ControllerAnalog remains available as low-level raw infrastructure, not the recommended consumer contract.
+
+
+PASS 181 - PREFERENCE-PRESERVING CONTROLLER THRESHOLD CONSTRAINTS
+
+Controller.Profile now separates user/calibration preferences from effective runtime stick/trigger thresholds. Effective stick thresholds always satisfy Deadzone < Release < Activation with 0.001 separation; lowering Activation can temporarily constrain Release/Deadzone without overwriting their preferred values, and raising Activation restores those preferences automatically. Trigger Release uses the same model while retaining the historical 0.050 hysteresis gap. Shared profile format Version=3 persists both layers and migrates Version-2 files by seeding preferences from their existing effective values.
+
+
+Pass 178 fixes near-center controller sampling: finite analog values are now authoritative at any magnitude, so Controller Test/Calibration/Voice Browser cannot substitute a synthetic digital +/-1 merely because the stick is inside an activation/deadzone threshold.
+Pass 177 adds a dedicated on-demand `controller-sampling` lane for shared Controller Calibration/Test. Those subviews sample at 10 ms / 100 Hz while active; binding capture stays at 20 ms / 50 Hz and ordinary hosted input stays at 50 ms / 20 Hz.
+
+Pass 176 makes the shared controller deadzone consumable by every ModUI consumer and corrects RightY human semantics. Raw RightY signs remain compatible with existing serialized tokens; NormalizeAxis/NormalizeStickFiltered apply the shared deadzone, and NormalizeStickSemantic exposes physical/menu-oriented RightY where Up is Up. TTS Voice Browser is the first existing consumer moved to the filtered shared axis because its Pass-175 debug run exposed rapid opposite springback.
+
+PASS 175 - SHARED CONTROLLER SETTINGS / CALIBRATION / TEST
+
+MortalShell2ModUI now owns one persistent controller interpretation profile and one reusable Controller Settings view-model for every consumer mod. New Controller.Profile stores conservative stick/trigger capture thresholds outside consumer state; Controller.Settings exposes manual tuning, guided center + full-range Left/Right stick cardinal calibration, and a live coherent controller test.
+
+The default profile preserves Pass-174 capture behavior. Calibration measures centered-stick offset/noise and the weakest deliberate cardinal onset, requires meaningful travel before accepting each cardinal, and records positive/negative stick ranges. Controller.Profile exposes CenteredStick() and NormalizeStick() so every consumer can interpret the same physical controller consistently. The saved profile lives at %LOCALAPPDATA%\MortalShell2ModUI_ControllerCalibration.ini when available, with a ModUI-folder fallback. A generated profile is intentionally not included in release packages.
+
+Runtime.InputHost snapshots the profile once at controller-binding recorder start. Host.InputService/Runtime.ControllerAnalog use the same profile-derived direct-activity discriminator for coherent same-frame capture/calibration samples and refresh the host-state profile only when a new controller sampling request begins. Ordinary menu-hotkey polling stays at 50 ms; binding capture requests 20 ms physical sampling, while Controller Calibration/Test requests a dedicated 10 ms / 100 Hz lane that is explicitly released on close/retirement. The live test presentation remains throttled to roughly 12.5 redraws/sec, so 100 Hz input sampling does not become 100 full native redraws/sec.
+
+Consumer mods do not duplicate calibration state. MortalShell2TTS v0.9.252 only launches the shared screen and supplies presentation/input adapters. Minimap and future providers can consume ModUI.Controller.Profile/Settings directly. Pass-173 adaptive Settings.Layout and Host.ShellService are unchanged.
+
+MortalShell2ModUI v0.61.6 / API 1 / Pass 174
+
+PASS 174 - USER-CALIBRATED COHERENT THUMBSTICK BINDING CAPTURE
+
+The user supplied two deliberate calibration rounds after the final Pass-173 zone: hold L1; sweep Left Stick Up, Down, Left, Right; then Right Stick Up, Down, Left, Right; repeat. The old recorder misclassified/missed several directions because X and Y were independently published/read and each axis could independently synthesize a digital +/-1 fallback. The log therefore sometimes paired a real ~0.13-0.76 scalar on the intended axis with a contradictory synthetic +/-1 orthogonal axis.
+
+Runtime.ControllerAnalog now exposes a capture-only coherent Stick() pair. A genuine direct scalar on either component suppresses digital fallback on the orthogonal component; paired native stick state is tried next; four digital cardinal FKeys are synthesized only when both direct axes are quiet. Host.InputService force-publishes all four stick axes on the same 20 ms capture poll with one primitive frame id. The TTS consumer accepts a stick direction only from a matched frame, preventing half-updated mailbox pairs. Binding-capture cardinal activation is calibrated to 0.12 from the supplied sweeps; neutral/release hysteresis remains required.
+
+Ordinary menu-hotkey polling, Voice Browser RightY, native navigation, open-binding evaluation, and idle performance are unchanged. Pass-173 held-L3 chord-break rearm remains intact.
+
+MortalShell2ModUI v0.61.5 / API 1 / Pass 173
+
+PASS 173 - CONTROLLER CHORD-BREAK REARM + ADAPTIVE SHARED SETTINGS GEOMETRY
+
+Runtime.InputHost restores deliberate repeated controller-chord edges during ordinary settled gameplay without increasing polling frequency. After an L3+R3 toggle, the chord may rearm when it becomes incomplete once, so L3 can remain held while R3 is released/repressed. Full-neutral safety remains mandatory across LoadMap/controller-identity/ownership/capture boundaries, and a continuously-held full chord cannot retrigger.
+
+Settings.Layout now resolves bounded main-profile label/value rail widths from the actual rendered primitive strings. Host.ShellService applies the same resolved geometry to the native rails/prompt/background and caches a width signature so native setters run only when geometry changes. Browser geometry remains fixed. TTS fallback rendering and pointer hitboxes consume the same resolver, preventing text/pointer drift as rails widen.
+
+MortalShell2ModUI v0.61.4 / API 1 / Pass 171
+
+PASS 171 - PRE-LOADMAP TRANSITION-REJECTION INTENT BRIDGE
+
+Runtime.InputHost now closes the narrow interval where a fresh open edge reaches the consumer while the old gameplay controller is still valid, but native OptionsMenuQuery has already denied Settings immediately before UEngine.LoadMap-pre. Only a consumer-classified `transition-native` rejection may arm the bridge.
+
+The bridge is primitive-only and expires after 1.5 seconds. It crosses a boundary only when LoadMap PRE actually follows, at which point it becomes the normal new-world pending intent and retains the existing gameplay/context/identity/quiescence/full-release gates. Main Menu and other non-gameplay rejections do not arm it. The LoadMap PRE callback remains UObject-free.
+
+
+PASS 170 - QUEUED TRANSITION-OPEN ADMISSION SEPARATION
+
+Runtime.InputHost now treats true non-gameplay admission and transition/quiescence admission as separate gates. Main Menu/front-end denial remains hard and non-queueable. Once an incoming gameplay controller is valid, one fresh configured open-hotkey edge observed during the bounded post-LoadMap settle/quiescence window can be retained and auto-dispatched only after all transition gates clear and the binding is fully released.
+
+The hard UEngine.LoadMap PRE freeze remains primitive/UObject-free. No PlayerController is resolved or sampled there. Shared visible-shell, semantic-host, one-hotkey-owner, listener, provider, and multi-consumer behavior otherwise remain unchanged from v0.61.2.
+
+PASS 167 - FIRST POST-ZONE HOTKEY INTENT RETENTION
+
+Runtime.InputHost now retains at most one deliberate menu-open edge observed while the incoming world/controller is inside the bounded post-LoadMap identity/quiescence/rearm window. The intent is primitive-only and world-epoch-bound. It dispatches only after gameplay/transition admission succeeds and both configured open bindings are fully released.
+
+LoadMap still clears all pending state and keeps delayed polls UObject-free while frozen. Controller chords still require a post-world neutral sample before they may be retained, preventing held-across-world auto-open. Non-gameplay context, alternate opening, or release-query failure clears pending intent safely. The shared single-hotkey-owner architecture is unchanged.
+
+PASS 163 - SHARED-SHELL PRESENTATION SAFETY / PRODUCTIONIZATION AFTER REAL SECOND-CONSUMER PROOF
+
+Pass 162 real independent-consumer proof is accepted. The temporary MortalShell2ModUIProbe is no longer part of the production package; Host.ConsumerClient, provider arbitration, one canonical hotkey/listener/semantic host and the single visible shell remain public framework capabilities.
+
+Core.Text adds line-aware UTF-8-safe EllipsizeLines. Settings.PresentationSafety applies profile-specific hard bounds to primitive consumer presentation snapshots before Host.ShellService mutates native UMG text. The host logs a bounded host.shell.presentationSafety diagnostic only when a new field set is clipped. This prevents one future mod from overlapping/corrupting neighboring shared-shell rails without forcing every consumer to duplicate TTS formatting policy.
+
+PASS 162 - REAL INDEPENDENT SECOND-CONSUMER INTEGRATION / HOST PROVIDER SELECTOR (HISTORICAL)
+
+Pass 161 is runtime-proven: six Settings sessions used the ModUI-owned session-bounded semantic hook, six hooks armed/retired cleanly, three descriptor revisions preserved the exact shell and semantic-hook addresses, four LoadMap-pre world resets were clean, and TTS registered no healthy-path local semantic hook.
+
+This pass originally used F8 to cycle a single hotkey owner. v0.65 retires that user-facing control: each provider now owns its own binding and opens itself directly. ProviderSelector remains an internal/test API only.
+
+Host.ConsumerClient now exposes NativeInput(), so an independent consumer can request the canonical host-owned WBP_InputListener/semantic service without copying Registry internals.
+The Pass-162 pre-package harness also caught the facade using the wrong HostMetadata epoch field; the final NativeInput() implementation reads HostMetadata().epoch and is executable-harness proven.
+
+The Pass-162 package intentionally includes MortalShell2ModUIProbe, a temporary second UE4SS mod/Lua state. It registers as a settings provider but NOT as a hotkey owner. This is the real cross-state integration proof that the synthetic harness could not provide.
+
+The old F8 test below is retired in v0.65. Validate each provider with its own configured binding and confirm that an attempted second-provider open cannot replace an active modal session.
+
+
+PASS 161 - BOUNDED SHARED-MENU SEMANTIC HOST + REVISION-CONTINUOUS SHELL
+
+Host.SemanticService now owns exactly one InputTriggeredCallback hook only while the canonical active shared-menu session/lease and exact host-owned listener address are live. Callback Context is primitive-address filtered before semantic/pointer/controller work. The hook retires on close/LoadMap and survives same-consumer/same-generation descriptor revisions. The rejected process-wide mirror remains isolated.
+
+Host.InputService also publishes routed native semantics and active-consumer fixed-keyboard navigation through the generic primitive menu-action ring. Host.ConsumerClient adds ActiveProvider/ActivateByIndex/ProviderPosition helpers. Host.ShellService keeps the exact same visible UMG instance across descriptor revision changes within the same menu generation.
+
+Pass-160 visible-shell ownership is runtime-proven; Pass 161 targets the remaining generic semantic-host dependency needed before a real second mod can consume the shared window without TTS driving its input callback.
+
+
+PASS 160 - SINGLE-OWNER VISIBLE SHELL + MULTI-CONSUMER PRESENTATION PLANE
+
+MortalShell2ModUI now owns the healthy-path visible native Settings shell in addition to the already-proven physical input host. Host.ShellService constructs one borrowed WBP_ConfirmationPrompt_ReadText shell, applies the shared Settings.Layout geometry, renders the active consumer's primitive presentation, owns focus/input-mode setup, and quarantines/clears shell UObject references across LoadMap boundaries.
+
+The multi-consumer control plane is now public rather than TTS-specific:
+- Host.ConsumerClient: supported consumer facade for registration, activation, session/lease publication, primitive presentation and action consumption.
+- Host.Registry/Protocol: revision-bound primitive menu presentation, host->consumer action ring, active-consumer request and provider directory metadata.
+- Host.MenuService: deterministic active-consumer arbitration plus one canonical physical menu-hotkey owner across all registered consumers.
+- Settings.Layout: canonical native shell geometry shared by host rendering and consumer pointer semantics.
+
+A two-consumer executable harness uses MortalShell2TTS plus a synthetic Minimap provider to prove simultaneous registration, active-consumer switching without a registry revision, one hotkey owner, independent presentations, selected-consumer lease/session authority, host action delivery, provider cycling, and stale-revision rejection.
+
+The rejected process-wide WBP_InputListener_C:InputTriggeredCallback mirror remains isolated. Existing transition-quarantined hosted hotkey, host-owned physical listener, capture edge-continuity and bounded consumer semantics are preserved.

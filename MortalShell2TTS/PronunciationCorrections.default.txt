@@ -1,0 +1,64 @@
+# MortalShell2TTS curated pronunciation defaults
+# Pass 124 / v0.9.201 - pronunciation subsystem remains frozen; active rule data unchanged from Pass 84
+#
+# Format: match | spoken-as | scope [| unsupported-voice-fallback]
+# These are the ACTIVE shipped defaults. The LocalAppData file is only an override layer.
+# TAB-separated match<TAB>spoken-as<TAB>scope<TAB>fallback lines are also accepted.
+# Scope: azure | local | all
+#
+# Matching is case-insensitive and only replaces a whole word or whole phrase.
+# "spoken-as" can be either a plain alias or, for Azure-only rules, ipa:<phones>.
+# IPA rules may add an optional fourth field: fallback:<plain spelling>. The helper
+# uses IPA only for voice families that support <phoneme>; unsupported/unknown voices
+# automatically receive the fallback spelling instead. Plain aliases remain useful
+# for simple compounds and names. These defaults are intentionally Azure-scoped because
+# the initial report was against Azure/MAI
+# narration. Windows local voices remain unchanged unless a user adds an "all"
+# or "local" override in:
+#   %LOCALAPPDATA%\MortalShell2TTS\PronunciationCorrections.txt
+#
+# User overrides are persistent and win over shipped defaults by match text.
+# Use spoken-as !disable in the user file to disable a shipped default.
+# The helper notices edits and reloads this small dictionary before the next
+# synthesis request; no game restart or settings UI is required.
+#
+# User-reported / high-confidence English corrections:
+bosom | ipa:ˈbʊz.əm | azure | fallback:buzum
+harbinger | ipa:ˈhɑɹ.bɪn.dʒɚ | azure | fallback:harbinjur
+#
+# Mortal Shell I/II vocabulary with a high-confidence reading. Tiel is commonly
+# transcribed as "Teal"; Ova/Ovum and Mammon follow standard English readings.
+Tiel | teal | azure
+Ova | oh-vuh | azure
+Ovum | oh-vum | azure
+Mammon | mam-un | azure
+#
+# Common dark-fantasy / Mortal Shell words that are easy for a voice model to
+# stress or segment oddly:
+censer | sen-ser | azure
+acolyte | ack-uh-lite | azure
+hierarch | high-uh-rark | azure
+justiciar | jus-tish-ee-er | azure
+revenant | rev-uh-nunt | azure
+sanguine | sang-gwin | azure
+apostate | uh-pos-tate | azure
+reliquary | rel-uh-kware-ee | azure
+sepulcher | sep-uhl-ker | azure
+sepulchre | sep-uhl-ker | azure
+#
+# Game compounds whose intended word boundaries are unambiguous:
+Tarforge | tar forge | azure
+Tarstone | tar stone | azure
+Blackmarrow | black marrow | azure
+#
+# Researched but intentionally NOT guessed here:
+# Hadern, Harros, Eredrim, Genessa, Proxima, Gragu, Smert, Lazlo, Sariel,
+# Vatra, Fainweald, Nochte, Zhirelle, Mether/Undermether, Crucix, Imrod,
+# Sester, Thestus, Grisha.
+# These are proper/game-coined names whose authoritative in-game reading was not
+# established confidently enough for a shipped correction. Add one to the
+# persistent override file after hearing the reading you want.
+#
+# Also intentionally omitted: context-dependent English homographs such as
+# bow, lead, read, wind, tear, wound, live, close, and does. A global replacement
+# could fix one sentence while making another sentence wrong.
