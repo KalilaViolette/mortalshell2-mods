@@ -12,6 +12,17 @@ function Factory.New(ctx)
     local global_runtime = assert(ctx.GlobalRuntime, "Runtime.Lifecycle requires GlobalRuntime")
     local instance_generation = assert(ctx.InstanceGeneration, "Runtime.Lifecycle requires InstanceGeneration")
     local log = assert(ctx.Log, "Runtime.Lifecycle requires Log")
+    -- Injected where it is offered so the regression can drive the cutscene hold by hand
+    -- rather than by sleeping, which is the same reason Map/FogLayer.lua takes one.
+    local clock = type(ctx.Clock) == "function" and ctx.Clock or os.clock
+    -- Core/Timeline.lua. Soft rather than asserted: main.lua refuses to start without it,
+    -- but the offline suites build a ctx by hand and a measurement module is not something
+    -- a test should have to supply to exercise the lifecycle. One table, built once.
+    local Timeline = ctx.Timeline or {
+        Reset = function() end, Stamp = function() end,
+        Poll = function() end, Report = function() end,
+        Line = function() return nil end,
+    }
     local Perf = type(ctx.Perf) == "table" and ctx.Perf
         or { Begin = function() return nil end, End = function() end, Mark = function() end,
              Tick = function() return false end }
@@ -55,6 +66,38 @@ function Factory.New(ctx)
         return Perf.Begin()
     end
 
+    -- v0.23.38. THE SCHEDULER WAS THE BLIND SPOT THIS TIME.
+    --
+    -- Her death-and-reload crash: the minimap was hidden by the loading screen, so
+    -- runtime_tick_body returned at `if not state.visible` and the whole render half of
+    -- the tick was inert. The last Lua line was "Tick stage=combat" and the last line of
+    -- any kind was UE4SS's own "Asset loaded" -- AFTER that tick had already returned. So
+    -- the fatal call was not in the tick at all; it was in a scheduled background slice,
+    -- and every one of those is invisible in the log.
+    --
+    -- Invariant 0y says read the code between the last crumb and the next one that would
+    -- have printed. Between "Tick stage=combat" and the next tick's "Tick stage=ui_read"
+    -- sits ctx.Combat.Update(), the visibility return, and an unbounded number of
+    -- background slices. Three different suspects behind one crumb, which is exactly the
+    -- shape that cost v0.23.35.
+    --
+    -- So: every scheduled callback names itself as it starts and as it finishes, by the
+    -- label it was already given for its perf section. No new vocabulary, no new gate.
+    local function trace_crumb(name)
+        if Config.LocalDiscoveryTrace == true then
+            print("[MortalShell2Minimap] Work crumb step=" .. tostring(name) .. "\n")
+        end
+    end
+
+    -- The exit half of stage(), and deliberately NOT stage() itself: stage() opens a perf
+    -- token, and calling it for an exit would start a timer nobody ends -- a diagnostic
+    -- paying a cost the thing it measures does not (invariant 0l).
+    local function stage_done(name)
+        if Config.LocalDiscoveryTrace == true then
+            print("[MortalShell2Minimap] Tick stage=" .. tostring(name) .. "-done\n")
+        end
+    end
+
     local function pose_delay()
         local hz = math.max(5, math.min(60, math.max(
             tonumber(Config.PanUpdatesPerSecond) or 30,
@@ -74,11 +117,14 @@ function Factory.New(ctx)
         end
         if type(ExecuteInGameThreadWithDelay) ~= "function" then return false end
         local section = "schedule." .. tostring(label or "unlabelled")
+        local crumb_name = tostring(label or "unlabelled")
         local ok = pcall(ExecuteInGameThreadWithDelay,
             math.max(1, math.floor(tonumber(delay_ms) or 1)), function()
                 if global_runtime.generation ~= instance_generation then return end
                 local token = Perf.Begin()
+                trace_crumb(crumb_name)
                 callback()
+                trace_crumb(crumb_name .. "-done")
                 Perf.End(section, token)
             end)
         return ok
@@ -117,6 +163,119 @@ function Factory.New(ctx)
         return state.native_menu_state ~= "settling"
     end
 
+    -- How long the map will stay hidden waiting for a loading-screen completion that
+    -- never comes. The measured worst case for a finished minimap, back when the settle
+    -- was 5000 ms, was about 8.7 s; twelve gives that room and still fails visible rather
+    -- than leaving a player with no minimap because one Blueprint hook did not take.
+    local LOADING_SCREEN_CEILING_S = 12.0
+
+    local function loading_screen_hides_map()
+        if not state.loading_screen_active then return false end
+        local since = tonumber(state.loading_screen_since)
+        if since ~= nil and (os.clock() - since) >= LOADING_SCREEN_CEILING_S then
+            state.loading_screen_active = false
+            state.loading_screen_timed_out = true
+            log(string.format(
+                "Loading screen completion never arrived after %.0f s; showing the minimap "
+                .. "anyway. The hook on BPC_UserInterfaceHandler_C is not firing -- the map "
+                .. "is correct, the hiding is what is broken.", LOADING_SCREEN_CEILING_S))
+            return false
+        end
+        return true
+    end
+
+    -- THE CUTSCENE TEST. v0.23.61, and it is the VIEW TARGET rather than any of the three
+    -- things that sound like they ought to work.
+    --
+    -- bCinematicMode is checked further down this same function and has been for a long
+    -- time. It never fires for this game's cutscenes: her runs had the minimap up through
+    -- every one of them while that flag stayed false.
+    --
+    -- BP_MusicState_Cinematic_C moves for the opening video and NOT for the in-engine
+    -- cutscene immediately after it. Measured twice, at a marked moment both times. It was
+    -- the cheap option -- the combat module already polls that state -- and it would have
+    -- shipped a fix that misses the exact cutscene she complained about.
+    --
+    -- State.InCutscene is the game's own answer: GE_State_InCutscene_C grants it, and the
+    -- game's own Map, Character and Options menus all refuse to open while it is set. It is
+    -- UNREACHABLE. The ability component exposes no tag-reading UFunction (enumerated: six
+    -- functions matching "tag", all of them about ability input), and building an
+    -- FGameplayTag from Lua hard-killed the process twice. See invariant 0z.
+    --
+    -- What DID move, at twelve of twelve marked moments across three runs, is who the
+    -- camera is looking at. MEASURED durations:
+    --
+    --     real cutscenes    5.0   5.2   24.6   26.8   33.3   58.2  seconds
+    --     false positives   0.1   0.1                               seconds
+    --
+    -- The two false positives have different causes and the same length. One is a level
+    -- load, where the camera is briefly the CONTROLLER; one is mid boss fight, where it is
+    -- briefly a DIFFERENT BP_PlayerCharacter_C than the pawn -- same class, different
+    -- instance, which is why this compares by ADDRESS and not by class name. Both lasted
+    -- exactly one 100 ms sample.
+    --
+    -- So the hold is not a taste call. It sits an order of magnitude above every false
+    -- positive seen and an order of magnitude below the shortest real cutscene.
+    local CUTSCENE_HOLD_SECONDS = 0.5
+
+    -- nil means NO OPINION: no controller, no pawn, or a read that refused. Never false
+    -- and never true. Hiding a player's minimap because a property read failed is the
+    -- worst outcome available here and the hardest one for them to describe in a report.
+    local function camera_left_the_player()
+        local controller = state.controller
+        local pawn = state.player
+        if controller == nil or pawn == nil then return nil end
+        if not Object.Valid(controller) or not Object.Valid(pawn) then return nil end
+        local manager = nil
+        if not pcall(function() manager = controller.PlayerCameraManager end) then return nil end
+        if not Object.Valid(manager) then return nil end
+        local target = nil
+        if not pcall(function() target = manager.ViewTarget.Target end) then return nil end
+        if not Object.Valid(target) then return nil end
+        return not Object.Same(target, pawn), Object.ClassShortName(target)
+    end
+
+    -- v0.23.62. WHAT TOOK THE CAMERA DECIDES HOW FAST WE TRUST IT.
+    --
+    -- Her report on v0.23.61: "the minimap appeared for like 0.4 seconds then hid during
+    -- the cutscene." That is the hold doing exactly what it was built to do and being
+    -- wrong anyway -- it buys protection from two 0.1 s blips by putting half a second of
+    -- minimap at the front of every real cutscene, which is the thing she can see.
+    --
+    -- The measurements already separate the two populations by more than duration:
+    --     real cutscenes    CineCameraActor, CSCineCameraActor
+    --     false positives   BP_PlayerController_C, BP_PlayerCharacter_C
+    -- A cine camera is not ambiguous. Nothing in this game hands the view to one for a
+    -- tenth of a second by accident, and both of the false positives were ordinary gameplay
+    -- objects.
+    --
+    -- THIS IS A FAST PATH, NOT A GATE. An unrecognised class still hides, just on the
+    -- hold, so a cutscene driven by some camera class we have never seen is late rather
+    -- than missed. The identity comparison above is untouched and still decides WHETHER
+    -- the camera has left her; this only decides how long to wait before believing it.
+    local function is_cine_camera(class_name)
+        return type(class_name) == "string"
+            and class_name:find("CineCamera", 1, true) ~= nil
+    end
+
+    local function cutscene_hides_map()
+        local away, class_name = camera_left_the_player()
+        if away == nil or away == false then
+            -- Cleared on "back on the player" AND on "cannot tell", so the countdown can
+            -- never be carried across a world change and fire instantly on the far side.
+            state.cutscene_since = nil
+            return false
+        end
+        -- A cine camera has it: hide on the same frame, no hold.
+        if is_cine_camera(class_name) then
+            state.cutscene_since = state.cutscene_since or clock()
+            return true
+        end
+        local now = clock()
+        if state.cutscene_since == nil then state.cutscene_since = now end
+        return (now - state.cutscene_since) >= CUTSCENE_HOLD_SECONDS
+    end
+
     local function should_hide()
         if not Config.Enabled then return true, "disabled" end
         -- Minimap's own settings are a live-preview surface. Keep rendering so
@@ -146,6 +305,33 @@ function Factory.New(ctx)
             return false, "settings-preview"
         end
         if state.modui_shell_active then return true, "modui" end
+
+        -- THE LOADING SCREEN. v0.23.4.
+        --
+        -- Her report, 2026-09-17: "Currently you have the minimap loading in during the
+        -- loading screen ... users won't like seeing it flash up during the loading
+        -- screen, any way to make the entire widget not visible during the loading screen
+        -- and still be able to load what it needs to? Like be active but invisible."
+        --
+        -- That is a regression this session introduced, and she is right about it. The
+        -- settle that gated the build used to be five seconds, which hid the problem by
+        -- accident: the map was not built yet, so there was nothing to flash. Measuring
+        -- that settle and cutting it moved the build to 1.1 s after the map load, which
+        -- is during the loading screen.
+        --
+        -- The fix is to stop conflating "may build" with "may be seen". Building,
+        -- resolving icon textures and warming the fog cache all run behind world_ready
+        -- and are untouched by this -- so the work still happens as early as possible,
+        -- and the finished minimap is simply collapsed until the loading screen says it
+        -- has gone. Active but invisible, exactly as she put it.
+        --
+        -- The signal is the game's own, from its cooked exports rather than a guess:
+        -- BPC_UserInterfaceHandler_C::CreateLoadingScreen and its
+        -- LoadingScreenCompletedCallback. Invariant 0j says a hook is not a source until
+        -- a run says it fired, so there is a ceiling underneath it: if the completion
+        -- never arrives the map appears anyway, and the log says the hook is dead.
+        if loading_screen_hides_map() then return true, "loading-screen" end
+
         if native_menu_hides_map() then return true, "native-menu" end
         -- The hook gate protects the dangerous opening transition, while the
         -- controller signal remains the long-lived visibility source. The latter
@@ -154,6 +340,10 @@ function Factory.New(ctx)
         local cinematic = false
         pcall(function() cinematic = Object.AsBoolean(state.controller.bCinematicMode) end)
         if cinematic then return true, "cinematic" end
+        -- v0.23.61: and the one that actually moves in this game. Restores the INSTANT the
+        -- camera is back on her, because a cutscene ending is not a moment to be cautious
+        -- about -- only the hiding is held.
+        if cutscene_hides_map() then return true, "cutscene" end
         -- v0.18.0 "Hide in combat": the combat module has already faded the map to
         -- nothing by the time it asks; collapsing it here also stops the overlay work.
         if type(ctx.Combat) == "table" and type(ctx.Combat.WantsHide) == "function"
@@ -295,8 +485,10 @@ function Factory.New(ctx)
                 return 500
             end
             local token = stage("build")
+            Timeline.Stamp("build_first_try")
             local built_now = Renderer.Build()
             Perf.End("tick.build", token)
+            if built_now then Timeline.Stamp("built") end
             if built_now then
                 state.build_retry_failures = 0
                 state.build_retry_countdown = 1
@@ -319,6 +511,7 @@ function Factory.New(ctx)
             if built_now and type(ctx.POI) == "table"
                 and type(ctx.POI.OnRendererReady) == "function" then
                 token = stage("renderer_ready")
+                Timeline.Stamp("renderer_ready")
                 ctx.POI.OnRendererReady()
                 Perf.End("tick.renderer_ready", token)
             end
@@ -337,6 +530,11 @@ function Factory.New(ctx)
         if type(ctx.Combat) == "table" and type(ctx.Combat.Update) == "function" then
             local token = stage("combat")
             ctx.Combat.Update()
+            -- Bracketed, so "combat" as the last line means Combat.Update died and
+            -- "combat-done" means the tick got out and something else did. Without this
+            -- the two are the same picture, and the hidden-map path makes the second one
+            -- the common case: there are no further stages to print.
+            stage_done("combat")
             Perf.End("tick.combat", token)
         end
         if not state.visible then return 100 end
@@ -453,6 +651,9 @@ function Factory.New(ctx)
         local delay = runtime_tick_body()
         Perf.End("tick", token)
         Perf.Tick()
+        -- A load that never finishes is the one worth seeing. Poll is a boolean read
+        -- when no load is in flight and a subtraction when one is.
+        Timeline.Poll()
         return delay
     end
 
@@ -487,6 +688,7 @@ function Factory.New(ctx)
             if state.world_ready and not state.world_quarantined then return end
             state.world_quarantined = false
             state.world_ready = true
+            Timeline.Stamp("world_released")
             state.build_retry_countdown = 0
             -- v0.18.39: a released world is the event the backoff ladder exists to wait
             -- for, so it starts again at one attempt per second here.
@@ -495,10 +697,21 @@ function Factory.New(ctx)
             if type(ctx.POI) == "table" and type(ctx.POI.OnWorldReleased) == "function" then
                 ctx.POI.OnWorldReleased(reason)
             end
-            log("World released after settle; build may begin reason=" .. tostring(reason))
+            log(string.format("World released after settle (%d ms); build may begin reason=%s",
+                math.floor(tonumber(Config.WorldReleaseSettleMs) or 1000), tostring(reason)))
         end
         if type(ExecuteInGameThreadWithDelay) == "function" then
-            pcall(ExecuteInGameThreadWithDelay, 5000, function()
+            -- v0.23.3: the wait is a setting now, not a literal. It was 5000 and had been
+            -- since the mod was written, and the load timeline says it is 4935 of the
+            -- 8715 ms between a map load and a usable minimap -- by a wide margin the
+            -- largest single thing between her pressing Continue and seeing icons. The
+            -- default is still 5000; what changed is that the number can now be swept
+            -- unattended, one value per launch, with Core/Timeline.lua reporting each
+            -- result, instead of being lowered by feel on a path whose failure mode is a
+            -- crash on every load.
+            local settle = math.max(250, math.min(10000,
+                math.floor(tonumber(Config.WorldReleaseSettleMs) or 1000)))
+            pcall(ExecuteInGameThreadWithDelay, settle, function()
                 local token = Perf.Begin()
                 callback()
                 Perf.End("lifecycle.world-release", token)
@@ -511,6 +724,16 @@ function Factory.New(ctx)
     local function load_map_pre()
         if global_runtime.generation ~= instance_generation then return end
         local token = Perf.Begin()
+        -- A new world means a new timeline. Whatever the previous load measured has
+        -- already been reported; mixing two loads into one line measures neither.
+        Timeline.Reset("load-map")
+        Timeline.Stamp("load_pre")
+        -- A map load means a loading screen. Set here rather than waiting for the game's
+        -- CreateLoadingScreen, because the window that matters starts now and a hook that
+        -- fires late would leave exactly the flash this prevents.
+        state.loading_screen_active = true
+        state.loading_screen_since = os.clock()
+        state.loading_screen_timed_out = false
         state.lifecycle_epoch = state.lifecycle_epoch + 1
         state.world_quarantined = true
         state.world_ready = false
@@ -526,7 +749,26 @@ function Factory.New(ctx)
 
     local function load_map_post()
         if global_runtime.generation ~= instance_generation then return end
+        Timeline.Stamp("load_post")
         release_world_after_settle(state.lifecycle_epoch, "load-map-post")
+    end
+
+    -- The same quarantine LoadMap PRE performs, callable by name.
+    --
+    -- QuitGame does not go through LoadMap. The world simply ends, and every actor in it
+    -- fires ReceiveEndPlay on the way out -- which this mod hooks. A run that quit cleanly
+    -- died mid-storm with an access violation, hundreds of ai.ReceiveEndPlay lines deep:
+    -- invariant 0, reading game-destroyable objects from scheduled work, at the one moment
+    -- everything in the world is being destroyed at once.
+    --
+    -- So a caller that is about to end the world says so first, and gets the same
+    -- treatment a map change gets.
+    function runtime.Quarantine(reason)
+        if global_runtime.generation ~= instance_generation then return false end
+        if state.world_quarantined then return true end
+        load_map_pre()
+        log("Quarantined on request reason=" .. tostring(reason or "unspecified"))
+        return true
     end
 
     function runtime.Start()
@@ -545,6 +787,49 @@ function Factory.New(ctx)
         if type(RegisterLoadMapPostHook) == "function" then
             local ok, hook_error = pcall(RegisterLoadMapPostHook, load_map_post)
             if not ok then log("LoadMap POST hook failed: " .. tostring(hook_error)) end
+        end
+
+        -- THE GAME'S OWN LOADING-SCREEN COMPLETION. v0.23.4.
+        --
+        -- Names from the cooked exports, not guesses: BPC_UserInterfaceHandler_C carries
+        -- CreateLoadingScreen, LoadingScreenCompletedCallback and an
+        -- OnLoadingScreenCompleted delegate, and the screens themselves are
+        -- WBP_LoadingScreenBase_C and WBP_LoadingScreen_FadeToBlack_C.
+        --
+        -- Both ends are hooked. The create is belt and braces -- load_map_pre has already
+        -- raised the flag by the time it fires -- and the completion is the one that
+        -- matters. Each handler does exactly one thing: set a boolean. No engine reads, no
+        -- allocation, nothing that can fault inside a game callback.
+        --
+        -- Invariant 0j: a hook is not a source until a run says it fired, so the ceiling
+        -- in loading_screen_hides_map() is what makes this safe to ship. If neither hook
+        -- ever fires the map appears twelve seconds in and the log says why.
+        if type(RegisterHook) == "function" then
+            local function loading_hook(path, handler, label)
+                local ok, err = pcall(RegisterHook, path, handler)
+                if ok then
+                    state.loading_hooks = (tonumber(state.loading_hooks) or 0) + 1
+                else
+                    log("Loading screen hook failed (" .. label .. "): " .. tostring(err))
+                end
+            end
+            loading_hook("/Game/Sparta/UI/Core/BPC_UserInterfaceHandler.BPC_UserInterfaceHandler_C:CreateLoadingScreen",
+                function()
+                    if global_runtime.generation ~= instance_generation then return end
+                    state.loading_screen_active = true
+                    state.loading_screen_since = os.clock()
+                end, "create")
+            loading_hook("/Game/Sparta/UI/Core/BPC_UserInterfaceHandler.BPC_UserInterfaceHandler_C:LoadingScreenCompletedCallback",
+                function()
+                    if global_runtime.generation ~= instance_generation then return end
+                    if state.loading_screen_active then
+                        state.loading_screen_active = false
+                        log(string.format(
+                            "Loading screen completed after %.2f s; the minimap is shown now. "
+                            .. "It has been built and running behind it the whole time.",
+                            os.clock() - (tonumber(state.loading_screen_since) or os.clock())))
+                    end
+                end, "completed")
         end
 
         if type(RegisterInitGameStatePostHook) == "function" then

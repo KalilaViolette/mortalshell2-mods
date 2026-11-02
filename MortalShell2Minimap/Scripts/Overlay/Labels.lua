@@ -272,6 +272,17 @@ function Factory.New(ctx)
     local function cardinals_enabled() local m = mode() return m == 2 or m == 3 end
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)

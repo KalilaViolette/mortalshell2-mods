@@ -83,6 +83,17 @@ function Factory.New(ctx)
     end
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)
@@ -138,7 +149,17 @@ function Factory.New(ctx)
             entry.slot = slot
             slot:SetPosition({ X = -10000, Y = -10000 })
             slot:SetSize({ X = 1, Y = 1 })
-            pcall(slot.SetZOrder, slot, 2) -- under every marker, over the tiles
+            -- ABOVE THE FOG, STILL UNDER EVERY MARKER. v0.23.35.
+            --
+            -- Her report: "foot steps aren't rendering in my peek circle or the trail
+            -- behind me, they need their zorder fixed too." Same burial as the markers in
+            -- v0.23.31 and the same cause -- the fog draws at 4 and 5, and these were at 2.
+            -- Missed the first time because she had not mentioned footsteps yet and I fixed
+            -- only what was reported, which is how the second half of a bug survives.
+            --
+            -- 6 keeps the original relationship intact: over the tiles AND the fog, under
+            -- every marker, which now start at 7.
+            pcall(slot.SetZOrder, slot, 6) -- under every marker, over the fog and tiles
             image:SetVisibility(VIS_COLLAPSED)
             image:SetBrushFromTexture(texture, false)
         end)

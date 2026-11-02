@@ -51,7 +51,9 @@ function Factory.New(options)
         -- span is much smaller than this user-facing control. 2000 is the tested
         -- current baseline; the expanded ceiling reaches roughly a
         -- full native world-map span at the expanded 50,000 ceiling.
-        ZoomMeters = 1000,
+        -- 750, her decision 2026-09-17. Shows 54.2 m across at the default size, which
+        -- is the range she plays at herself.
+        ZoomMeters = 750,
         -- v0.18.3: Ctrl+Shift+M never worked as a shipped default. The game's own
         -- input handling sees that chord first and swallows the whole press, so the
         -- window would not open at all. These two are the binds that were actually
@@ -105,6 +107,11 @@ function Factory.New(options)
         -- MinimapConfig.ini when a bug report needs the call that faulted.
         EnemyRefreshHooks = true,
         LocalDiscoveryTrace = false,
+        -- v0.23.43. The per-frame breadcrumbs -- fog view, pose, dungeon capture -- on
+        -- their own switch. They found three real crashes and then kept charging 766
+        -- prints a second on the pose path for it. Separate from LocalDiscoveryTrace so
+        -- the cheap, still-useful traces can stay on without them.
+        TraceHotPaths = false,
         -- v0.16.8: the CAPTURE tab and the expert rows show only when this is on.
         AdvancedSettings = false,
         -- v0.11.3b: the letters are drawn in the map's ink; set this to 0 for plain
@@ -171,6 +178,147 @@ function Factory.New(options)
         -- every style, a color row under it). off | line | vector | ornate.
         MapFrame = "vector",
         MapFrameColor = "bronze", -- bronze | white | red | blue | green
+        -- v0.19.0 FOG tab (user decision 2026-09-16). Ships OFF: the fog layer is new
+        -- rendering and nobody should meet it without choosing to.
+        --
+        -- The reveal radius is a REAL WORLD DISTANCE, not a fraction of the visible
+        -- range, so zooming out never uncovers more of the world -- it only shows more
+        -- fog. Fog you can zoom past is not fog. The consequence is that the clear circle
+        -- looks small at a wide Map range and that is correct, not a bug to tune away.
+        --
+        -- Icons reveal at FOG_ICON_RADIUS_SCALE times this (Map/FogLayer.lua), so there
+        -- is one radius to set and the "half make something out through the fog" gap
+        -- holds automatically at every value. User decision 2026-09-16: tied, not its
+        -- own row.
+        -- ON by default, her decision 2026-09-17 -- which is what the design doc said
+        -- from the start and what the code never did. Fog is the headline feature of the
+        -- Cartographer page; a new install that does not show it is advertising something
+        -- the player has to go and find a switch for.
+        --
+        -- Existing installs are unaffected: a MinimapConfig.ini that already carries
+        -- FogEnabled keeps whatever it says. Only a fresh install starts here.
+        FogEnabled = true,
+        -- 40 m, her decision 2026-09-17 -- arrived at by measuring rather than by taste,
+        -- after 200 was tried first and photographed.
+        --
+        -- The number does not mean what it looks like. MEASURED at her own settings
+        -- (Size 500, Zoom 750) the minimap shows 90.8 m across -- a visible RADIUS of
+        -- 45.4 m. So a reveal radius LARGER than about 45 m clears the entire minimap and
+        -- there is simply no fog in normal play; the setting stops being "how much is
+        -- clear around you" and quietly becomes "how far must I zoom out before fog
+        -- exists at all".
+        --
+        -- At 200 m that was 4.4x her view. Four screenshots of a walked trail came back
+        -- completely clear -- no fog anywhere, so nothing for the trail to clear and
+        -- nothing for the peek circle to be a hole in. Zooming out far enough to find fog
+        -- (about ZoomMeters 3300 at her size) makes a 14 m trail 3.5% of the view: two or
+        -- three pixels. There was no zoom at which the feature could be seen.
+        --
+        -- 40 sat just inside the view radius, which made fog and the trail visible at
+        -- last. Then she saw it: "The fog radius is too large ... Radius needs to be 30%
+        -- less", and on looking again "Do 50% less instead of 30% that is really large".
+        -- So 20 -- half of 40 -- and the two steps are both recorded because the second
+        -- one is the useful signal: a radius that looked right in arithmetic looked far
+        -- too big on screen, twice over.
+        --
+        -- The whole range stays on the row for anyone who wants the map clear close in.
+        --
+        -- v0.23.62: TEN, and this one is worth more than the two steps above it. 20 was
+        -- arithmetic -- half of 40, decided in a day. 10 is what she actually played on
+        -- through the whole fog build, every crash hunt and every feature since, and her
+        -- verdict on it after all that time was "It looks really nice as it is. I really
+        -- like how mine is set up." A number somebody lived with beats a number somebody
+        -- reasoned about, and this is the first chance we have had to ship the lived one.
+        --
+        -- IT ALSO SETS THE TRAIL. trail_radius_meters() matches the peek when the width
+        -- row is 0 (the default), and the trail's forget distance is capped at
+        -- radius * 0.6 * 48 -- so 10 here means a 288 m trail ceiling, where 20 meant 576.
+        -- The two rows are joined and neither says so; see the note on FogTrailMeters.
+        FogRevealMeters = 10,
+        -- v0.23.39. The fade tail outside the peek circle. v0.23.42: 7.5 m, her number
+        -- after seeing 5 in play. Fractional on purpose -- clamp() and the row's
+        -- formatter both pass the value through untouched, so it round-trips as 7.5.
+        FogMarkerFadeMeters = 7.5,
+        -- v0.23.1 DEBUG ONLY, AND DELIBERATELY TEMPORARY.
+        --
+        -- Her idea, and a good one: move the position the FOG thinks the player is at,
+        -- without moving the player. Standing in explored ground means there is no fog to
+        -- test a peek hole against, and walking to a frontier is not something she can do
+        -- from work. A faked northward step slides the peek across the fog boundary so it
+        -- can be seen half in and half out, from a character that never moves.
+        --
+        -- Positive is NORTH. It offsets ONLY the centre the fog layer uses for its peek --
+        -- not the map pan, not the crop window, not the player marker -- so the peek
+        -- travels across a fog boundary that stays put, which is the whole point.
+        --
+        -- ZERO IS THE FAST PATH. At 0 the fog centre is passed through untouched and
+        -- nothing extra is computed, so this cannot cost anything in normal play. It is
+        -- meant to be removed once the fog is signed off; the chain should not carry a
+        -- fake position between the player and the peek forever.
+         -- off | show | hide. A support switch, not a feature. See Config/Schema.lua.
+        FogDiagnostic = "off",
+        -- Drives the map shader's RevealAmount, and the direction is now measured rather
+        -- than guessed: 0 ignores the mask entirely and lays the fog painting flat across
+        -- the whole minimap, and it bites harder as it rises. So the floor is 0.25 -- a
+        -- fog layer that ignores its own mask is not a setting, it is a bug wearing one.
+        FogMaskStrength = 0.75,
+        -- v0.23.3. HOW MUCH THE FOG HIDES, which is a different question from how
+        -- cleanly it keeps to its edges (FogMaskStrength, above).
+        --
+        -- Applied as render opacity on the fog layer itself, so at anything under 1 the
+        -- real map reads faintly through the cover. That is the point of the row: some
+        -- people want undiscovered ground gone, and some want a hint of the shape of it
+        -- so the minimap still tells them where the corridor goes. The discovered ground
+        -- is drawn by a SEPARATE layer above the fog and is never touched by this, so
+        -- turning the fog down makes the unexplored parts lighter and leaves everything
+        -- already explored exactly as it was.
+        --
+        -- Ships at 1.00: a fresh install, and every install that already exists, looks
+        -- exactly as it did before this row appeared. The floor is 0.10 rather than 0 --
+        -- fog at zero is fog switched off, and that is what FogEnabled is for.
+        FogOpacity = 1.00,
+        -- v0.23.5 THE SESSION TRAIL. Her idea and her specification (see
+        -- FOG_FEATURE_DESIGN.md, quoted verbatim): fog clears behind you as you walk and
+        -- comes back in two phases -- quickly to 15% while you lose the fine detail, then
+        -- slowly to 100% as you forget the route.
+        --
+        -- The age of a trail mark is measured in METRES WALKED, not seconds, which is the
+        -- whole character of the thing: standing still to read the map neither erases the
+        -- trail nor preserves it.
+        --
+        -- This is not permanent reveal. Permanent reveal needs the mod to own explored
+        -- state across sessions, which is a save-file-shaped problem; a trail that forgets
+        -- needs nothing persistent and is cleared with the world.
+        FogTrail = true,
+        -- How far back the trail is remembered, in metres walked. Clamped down at runtime
+        -- to whatever the redraw's draw-call ceiling can actually afford at the current
+        -- reveal radius -- the cost governs the setting, not the other way round.
+        --
+        -- v0.23.62: 1000, hers. Read this as "as long as the draw budget allows" rather
+        -- than as a distance, because at the shipped reveal radius of 10 the ceiling is
+        -- 288 m and this never reaches its own number. That is not a dead value the way an
+        -- unreachable settings row would be -- it is the top of the range meaning "give me
+        -- all of it", and it starts mattering the moment the reveal radius goes up.
+        FogTrailMeters = 1000,
+        -- v0.23.5, her decision: the trail's own width in metres, not a fraction of the
+        -- reveal radius. A trail is a path you walked, so its width is a real-world width
+        -- and has nothing to do with how far the fog happens to clear. Tying the two
+        -- together was my mistake and it only showed up once the reveal radius moved.
+        -- 0 = match the peek, which is the shipped default. Her request once she had seen
+        -- the trail working: the path should leave the clear circle at the circle's own
+        -- width rather than stepping in. An explicit width still overrides it.
+        FogTrailWidthMeters = 0,
+        -- off | gentle | full. The game's map material animates its own fog with wind and
+        -- distortion, tuned for the full-screen world map. On a minimap cropped to a
+        -- fortieth of the world the same numbers read as a churn, which is why this shipped
+        -- off.
+        --
+        -- v0.23.62: FULL. That reasoning was mine and it was wrong in practice -- the churn
+        -- I predicted is not what it looks like at the shipped reveal radius, and she has
+        -- played on full throughout. fog_motion_factor() scales the material's own numbers
+        -- by the visible span, which is the part that makes it work on a crop, and it is
+        -- applied on CHANGE rather than per frame, so full costs the same as off once set.
+        FogMotion = "full",
         -- v0.18.0 COMBAT tab (user decision 2026-09-14): what the minimap does while the
         -- game's own music state says you are fighting (Runtime/CombatState.lua). Fresh
         -- install: dims to half, same size, never hidden. Opacity and size are fractions
@@ -258,6 +406,59 @@ function Factory.New(options)
         DebugLog = false,
         -- v0.13.0: per-section CPU/count summaries every 10 s ([PERF] lines). Off is
         -- free. Also switches the shared ModUI host's logging on. PERFORMANCE_LOGGING.md.
+        -- v0.23.3. HOW LONG THE MOD WAITS AFTER A MAP LOAD BEFORE IT BUILDS.
+        --
+        -- Measured 2026-09-17, which is the only reason this row exists. The load
+        -- timeline (Core/Timeline.lua) on her machine:
+        --
+        --   loadPost        551 ms
+        --   worldReleased  5486 ms  (+4935)   <- this number
+        --   built          6098 ms  (+453)
+        --   poiAssets      7557 ms  (+1459)
+        --   localFirstIcon 8715 ms
+        --
+        -- Eight and a half seconds from the map loading to a finished minimap, and 4.9 of
+        -- them are this timer doing nothing. Her report: "Especially loading in, it's a
+        -- bit rough ... poi icons ... quite delayed loading in."
+        --
+        -- The wait is not pointless -- it exists so the mod does not read a half built
+        -- world -- but 5000 was a guess, never a measurement, and lowering it is not
+        -- something to do by feel: the failure mode is a crash on every load. So it is a
+        -- row, it sweeps unattended (one value per launch, the timeline reports each
+        -- one), and the shipping default moves only once there is evidence for where the
+        -- floor is. Until then it stays exactly where it has always been.
+        --
+        -- Build failure is already safe at any value: Renderer.Build() returns false on
+        -- an unbuildable world and the retry ladder backs off 1, 2, 4, 8, 16 s. What is
+        -- NOT proven safe is reading the world early, which is what this protects.
+        --
+        -- SHIPS AT 1000 (her decision, 2026-09-17). The sweep, one run per value on her
+        -- machine, measuring when the first local icon reached the screen:
+        --
+        --   5000 -> 8628 ms, map built at 6098      (the value this had always been)
+        --   2500 -> 10397 ms                        (worst; see the note below)
+        --   1000 -> map built at 1894 ms
+        --    500 -> 6538 ms, map built at 1336
+        --    250 -> 6108 and 6279 ms, map built at 1027 and 1128
+        --
+        -- 250 was the fastest and built first try with nothing missing on four consecutive
+        -- runs. She chose 1000 anyway, which is the right call and not the fast one: every
+        -- sample is from one machine, the failure mode is a minimap that does not build,
+        -- and 1000 keeps four times the headroom over the lowest value anyone has proven
+        -- while still moving the map from six seconds to under two. 250 is on the Advanced
+        -- row for anyone who wants it.
+        --
+        -- The 2500 result is not noise to explain away: the release waits on the game's own
+        -- InitGameState hook AS WELL as this timer, so the gap is (InitGameState delay +
+        -- settle) and the two interact. It is the reason a straight line through these
+        -- numbers would be wrong, and the reason a second sample matters more than a
+        -- smaller step.
+        --
+        -- None of this is what stops the minimap flashing during a loading screen -- that
+        -- is a separate gate on the game's own LoadingScreenCompletedCallback, in
+        -- Runtime/Lifecycle.lua. Building early and being visible early are different
+        -- things, and conflating them is what made the first version of this a regression.
+        WorldReleaseSettleMs = 1000,
         LogPerformance = false,
     }
 
@@ -330,6 +531,30 @@ function Factory.New(options)
         Values.OffsetX = math.floor(clamp(Values.OffsetX, 0, 2000, Defaults.OffsetX) + 0.5)
         Values.OffsetY = math.floor(clamp(Values.OffsetY, 0, 2000, Defaults.OffsetY) + 0.5)
         Values.ZoomMeters = clamp(Values.ZoomMeters, 25, 50000, Defaults.ZoomMeters)
+        Values.FogEnabled = boolean(Values.FogEnabled, Defaults.FogEnabled)
+        Values.FogRevealMeters = clamp(Values.FogRevealMeters, 5, 500, Defaults.FogRevealMeters)
+        Values.FogMarkerFadeMeters = clamp(Values.FogMarkerFadeMeters, 0, 200, Defaults.FogMarkerFadeMeters)
+        -- "world" (v0.22.4) is her idea, and it is the old bug turned into a tool: before
+        -- the crop was fixed the overlay drew the ENTIRE world painting into the circle.
+        -- Useless as fog, genuinely useful as a diagnostic -- it shows every area's reveal
+        -- holes in one picture, including the tutorial area, without walking to any of them.
+        Values.FogDiagnostic = one_of(Values.FogDiagnostic,
+            -- v0.23.47: "readback" belongs here too. It was added to the Schema's values
+            -- list in v0.23.45 and to its labels in v0.23.47, and missing from THIS list
+            -- meant one_of rejected it the instant the row set it and snapped back to the
+            -- default -- so the row cycled straight from "blends" to "off" and the option
+            -- was, from the player's side, simply not there. A diagnostic value needs all
+            -- THREE: the values list, the label, and this allow-list.
+            { "off", "show", "hide", "material", "world", "maskblack", "maskwhite", "viewmask", "nolayerb",
+              "nolayers", "params", "composite", "blends", "readback" },
+            Defaults.FogDiagnostic)
+        Values.FogMaskStrength = clamp(Values.FogMaskStrength, 0.25, 1.0, Defaults.FogMaskStrength)
+        Values.FogOpacity = clamp(Values.FogOpacity, 0.10, 1.0, Defaults.FogOpacity)
+        Values.FogTrail = boolean(Values.FogTrail, Defaults.FogTrail)
+        Values.FogTrailMeters = clamp(Values.FogTrailMeters, 25, 1000, Defaults.FogTrailMeters)
+        Values.FogTrailWidthMeters = clamp(Values.FogTrailWidthMeters, 0, 60,
+            Defaults.FogTrailWidthMeters)
+        Values.FogMotion = one_of(Values.FogMotion, { "off", "gentle", "full" }, Defaults.FogMotion)
         local function binding(value, fallback)
             value = tostring(value or ""):match("^%s*(.-)%s*$")
             if value == "" then return fallback end
@@ -409,6 +634,7 @@ Values[prefix .. "EdgeMinScale"], 0.20, 1.0, Defaults[prefix .. "EdgeMinScale"])
         Values.MapLabels = math.floor(clamp(Values.MapLabels, 0, 3, Defaults.MapLabels) + 0.5)
         Values.EnemyRefreshHooks = boolean(Values.EnemyRefreshHooks, Defaults.EnemyRefreshHooks)
         Values.LocalDiscoveryTrace = boolean(Values.LocalDiscoveryTrace, Defaults.LocalDiscoveryTrace)
+        Values.TraceHotPaths = boolean(Values.TraceHotPaths, Defaults.TraceHotPaths)
         Values.AdvancedSettings = boolean(Values.AdvancedSettings, Defaults.AdvancedSettings)
         Values.MapLabelInk = boolean(Values.MapLabelInk, Defaults.MapLabelInk)
         Values.MapLabelSize = math.floor(clamp(Values.MapLabelSize, 0, 28, Defaults.MapLabelSize) + 0.5)
@@ -492,6 +718,8 @@ Values[prefix .. "EdgeMinScale"], 0.20, 1.0, Defaults[prefix .. "EdgeMinScale"])
         Values.DungeonViewCeilingAuto = boolean(Values.DungeonViewCeilingAuto, Defaults.DungeonViewCeilingAuto)
         Values.DungeonViewCeilingMaxMeters = clamp(Values.DungeonViewCeilingMaxMeters, 3, 60, Defaults.DungeonViewCeilingMaxMeters)
         Values.DebugLog = boolean(Values.DebugLog, Defaults.DebugLog)
+        Values.WorldReleaseSettleMs = clamp(Values.WorldReleaseSettleMs, 250, 10000,
+            Defaults.WorldReleaseSettleMs)
         Values.LogPerformance = boolean(Values.LogPerformance, Defaults.LogPerformance)
     end
 
@@ -621,6 +849,7 @@ Values[prefix .. "EdgeMinScale"], 0.20, 1.0, Defaults[prefix .. "EdgeMinScale"])
         file:write("MapLabels=" .. tostring(Values.MapLabels) .. "\n")
         file:write("EnemyRefreshHooks=" .. tostring(Values.EnemyRefreshHooks) .. "\n")
         file:write("LocalDiscoveryTrace=" .. tostring(Values.LocalDiscoveryTrace) .. "\n")
+        file:write("TraceHotPaths=" .. tostring(Values.TraceHotPaths) .. "\n")
         file:write("AdvancedSettings=" .. tostring(Values.AdvancedSettings) .. "\n")
         file:write("MapLabelInk=" .. tostring(Values.MapLabelInk) .. "\n")
         file:write("MapLabelSize=" .. tostring(Values.MapLabelSize) .. "\n")
@@ -642,6 +871,16 @@ Values[prefix .. "EdgeMinScale"], 0.20, 1.0, Defaults[prefix .. "EdgeMinScale"])
         file:write("MapShape=" .. tostring(Values.MapShape) .. "\n")
         file:write("MapFrame=" .. tostring(Values.MapFrame) .. "\n")
         file:write("MapFrameColor=" .. tostring(Values.MapFrameColor) .. "\n")
+        file:write("FogEnabled=" .. tostring(Values.FogEnabled) .. "\n")
+        file:write("FogRevealMeters=" .. tostring(Values.FogRevealMeters) .. "\n")
+        file:write("FogMarkerFadeMeters=" .. tostring(Values.FogMarkerFadeMeters) .. "\n")
+        file:write("FogDiagnostic=" .. tostring(Values.FogDiagnostic) .. "\n")
+        file:write("FogMaskStrength=" .. string.format("%.2f", Values.FogMaskStrength) .. "\n")
+        file:write("FogOpacity=" .. string.format("%.2f", Values.FogOpacity) .. "\n")
+        file:write("FogTrail=" .. tostring(Values.FogTrail) .. "\n")
+        file:write("FogTrailMeters=" .. tostring(Values.FogTrailMeters) .. "\n")
+        file:write("FogTrailWidthMeters=" .. tostring(Values.FogTrailWidthMeters) .. "\n")
+        file:write("FogMotion=" .. tostring(Values.FogMotion) .. "\n")
         file:write("CombatHide=" .. tostring(Values.CombatHide) .. "\n")
         file:write("CombatOpacity=" .. string.format("%.2f", Values.CombatOpacity) .. "\n")
         file:write("CombatSize=" .. string.format("%.2f", Values.CombatSize) .. "\n")
@@ -686,6 +925,7 @@ Values[prefix .. "EdgeMinScale"], 0.20, 1.0, Defaults[prefix .. "EdgeMinScale"])
         file:write("DungeonViewCeilingAuto=" .. tostring(Values.DungeonViewCeilingAuto) .. "\n")
         file:write("DungeonViewCeilingMaxMeters=" .. tostring(Values.DungeonViewCeilingMaxMeters) .. "\n")
         file:write("DebugLog=" .. tostring(Values.DebugLog) .. "\n")
+        file:write("WorldReleaseSettleMs=" .. tostring(Values.WorldReleaseSettleMs) .. "\n")
         file:write("LogPerformance=" .. tostring(Values.LogPerformance) .. "\n")
         file:close()
         if perf ~= nil then perf.End("io.config.save", token) end

@@ -114,6 +114,17 @@ function Factory.New(ctx)
     end
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)
@@ -476,7 +487,27 @@ function Factory.New(ctx)
                 refs[index].slot = slot
                 slot:SetPosition({ X = -10000, Y = -10000 })
                 slot:SetSize({ X = size, Y = size })
-                pcall(slot.SetZOrder, slot, 5 + index)
+                -- ABOVE THE FOG. v0.23.31.
+                --
+                -- HER REPORT: "I can't see icons inside of my peek hole or trail behind me,
+                -- like enemies, items, etc. poi markers and local markers both. The only icon
+                -- i do see rendered is the height indicator."
+                --
+                -- She is right and the Z orders say so plainly. The fog is layer A at 4 and
+                -- layer B at 5 (Map/NativeWidget.lua), and these markers were sitting at 3, 4
+                -- and 5 -- level with the fog or beneath it. Fog became default-ON in v0.23.x
+                -- and quietly buried every marker with it; the height chevrons survived only
+                -- because they happened to be parented higher.
+                --
+                -- Markers belong ON TOP of the fog, which is also her instruction: "they can
+                -- sit on top like the elevation arrows do". What a marker means -- here is a
+                -- thing, and how far away it is -- is not something fog should be able to
+                -- swallow. Whether a marker should DIM with fog depth is a separate question
+                -- and a separate change; this one only stops them being hidden outright.
+                --
+                -- Kept below Z_ARROW (10) so the player marker still wins, and below the
+                -- labels (59/60) which have always drawn above everything.
+                pcall(slot.SetZOrder, slot, 7 + index)
                 image:SetVisibility(VIS_COLLAPSED)
             end
         end)

@@ -275,20 +275,34 @@ function Factory.New(ctx)
         return false, "normal"
     end
 
+    -- ONE SCRATCH TABLE, REUSED. v0.23.4.
+    --
+    -- This returned a fresh three-field table on every call, and runtime.Update calls it
+    -- unconditionally on every pose tick -- 30 a second, in combat and out of it, forever
+    -- -- to feed a comparison that usually says "no change" and throws the table away.
+    -- The module's own header says it is "cheap when nothing is moving: one clock read, a
+    -- poll every POLL_INTERVAL_S, and a target compare". The compare was an allocation;
+    -- now the header is true.
+    --
+    -- The scratch is only ever read before the next call. begin_transition COPIES out of
+    -- it into combat.target rather than keeping the reference, because keeping it would
+    -- mean the stored target silently changed under the next tick's write.
+    local wanted_scratch = { opacity = 1.0, scale = 1.0, hide = false }
+
     local function wanted_target(now)
         local preview = selected_preview()
         combat.preview = preview
         local wanted, phase = combat_look_wanted(now)
         if preview then wanted, phase = true, "preview" end
         if not wanted then
-            return { opacity = 1.0, scale = 1.0, hide = false }, phase
+            wanted_scratch.opacity, wanted_scratch.scale, wanted_scratch.hide = 1.0, 1.0, false
+            return wanted_scratch, phase
         end
         local hide = Config.CombatHide == true
-        return {
-            opacity = hide and 0.0 or clamp01(Config.CombatOpacity),
-            scale = math.max(0.5, math.min(1.0, tonumber(Config.CombatSize) or 1.0)),
-            hide = hide,
-        }, phase
+        wanted_scratch.opacity = hide and 0.0 or clamp01(Config.CombatOpacity)
+        wanted_scratch.scale = math.max(0.5, math.min(1.0, tonumber(Config.CombatSize) or 1.0))
+        wanted_scratch.hide = hide
+        return wanted_scratch, phase
     end
 
     local function same_target(a, b)
@@ -362,7 +376,13 @@ function Factory.New(ctx)
 
     local function begin_transition(target, now)
         combat.from.opacity, combat.from.scale = combat.look.opacity, combat.look.scale
-        combat.target = target
+        -- COPY, not assign. `target` is the reused scratch table (see wanted_target);
+        -- holding the reference would let the next tick's write change the transition's
+        -- destination underneath it, and every comparison after that would be against
+        -- itself and always equal.
+        combat.target.opacity = target.opacity
+        combat.target.scale = target.scale
+        combat.target.hide = target.hide
         combat.anim_duration = math.max(0.0, tonumber(Config.CombatTransition) or 0.0)
         combat.anim_start = now
         combat.metrics.transitions = combat.metrics.transitions + 1

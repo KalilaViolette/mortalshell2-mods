@@ -255,6 +255,58 @@ function Factory.New(state)
         return direct, runtime_data
     end
 
+    -- A CLASS MEMO, FOR /Script/ PATHS ONLY. v0.23.4.
+    --
+    -- Measured, on her machine, in one cold build: native.find 181 ms over 41 calls with
+    -- 22 of them over 2 ms, and native.findall 128 ms over 9 calls. Together that is more
+    -- than half of a 563 ms build, and the build is the largest single hitch left after
+    -- the fog redraw was fixed.
+    --
+    -- A good part of it is the same handful of engine UClasses resolved once per module
+    -- with no shared memo: "/Script/UMG.Image" is looked up eight separate times in one
+    -- build (TrackerPool, LocalPool, ObjectivePool, TrailPool, Frame, Labels, NativeWidget
+    -- and DungeonView), and the two Kismet library defaults twice each.
+    --
+    -- WHY THIS IS SAFE WHERE CACHING A UOBJECT IS NOT. Invariant 0 forbids retaining
+    -- wrappers to objects the game can destroy, and invariant 0e says a detached UObject
+    -- is gone. Neither applies to a /Script/ path: those are engine classes and CDOs that
+    -- exist for the life of the process, are not part of any world, and are not touched by
+    -- LoadMap. That is why the memo refuses anything that is not a /Script/ path rather
+    -- than being a general cache -- the general version is the one that would be a bug.
+    --
+    -- Every entry is still validated on the way out, so a memo that somehow went stale
+    -- misses and re-finds rather than handing back a dead wrapper.
+    local class_memo = {}
+    local memo_hits, memo_misses = 0, 0
+
+    function runtime.FindEngineClass(path, perf, section)
+        if type(path) ~= "string" or path:sub(1, 8) ~= "/Script/" then
+            return nil, "not-a-script-path"
+        end
+        local cached = class_memo[path]
+        if cached ~= nil and runtime.Valid(cached) then
+            memo_hits = memo_hits + 1
+            return cached
+        end
+        memo_misses = memo_misses + 1
+        local token = nil
+        if type(perf) == "table" and type(perf.Begin) == "function" then token = perf.Begin() end
+        local ok, value = pcall(StaticFindObject, path)
+        if token ~= nil and type(perf.End) == "function" then
+            perf.End(section or "native.find", token)
+        end
+        value = runtime.Unwrap(ok and value or nil)
+        if not runtime.Valid(value) then return nil, "not-found" end
+        class_memo[path] = value
+        return value
+    end
+
+    function runtime.EngineClassMemoStats()
+        local count = 0
+        for _ in pairs(class_memo) do count = count + 1 end
+        return count, memo_hits, memo_misses
+    end
+
     return runtime
 end
 

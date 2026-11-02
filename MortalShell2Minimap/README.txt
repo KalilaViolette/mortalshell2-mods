@@ -1,4 +1,4 @@
-MortalShell2Minimap v0.18.46
+MortalShell2Minimap v0.23.62
 A minimap for Mortal Shell II (UE4SS Lua mod)
 On Nexus this is published as "Cartographer - Minimap and Dungeon Maps". The
 folder has to stay MortalShell2Minimap, because that is the name UE4SS loads.
@@ -22,6 +22,18 @@ WHAT IT DOES
     leave when the thing is used: an opened chest, a collected pickup, a
     sprung trap, an exploded barrel, a harvested plant, a torch or cage you
     have already shot (and one the game restored as shot never shows).
+  - Fog of war (FOG tab), on by default: the world starts covered and you
+    uncover it by walking it, drawn with the game's own map fog over the
+    game's own map art. A circle around you stays clear so the map is still
+    worth having on, and past its edge icons fade out over a distance you set
+    instead of popping. Fog clears behind you as you walk and then comes
+    back, quickly at first so the fine detail goes within a few steps and
+    then slowly so the route itself fades over a longer walk. It forgets by
+    distance travelled rather than by time, so standing still to read the map
+    neither erases your trail nor keeps it, and the trail is not saved
+    between sessions. Ground a map fragment has already revealed stays
+    revealed, and the clear circle stops following you while you are standing
+    on it, because there is nothing there left to uncover.
   - A frame around the map (GENERAL tab): a thin ring or crisp bars, an
     engine-drawn vector outline, or the world map's compass ring / the game's
     gold rule, in a choice of colors, or off.
@@ -95,6 +107,15 @@ SETTINGS (tabs in the window)
            (1-20 m, default 3), arrow size, and the height fade: its
            opacity at the threshold (75%), its minimum (35%) and how many
            meters past the threshold it takes to get there (15).
+  FOG      Fog of war: fog on/off, the reveal radius (how far around you the
+           fog clears, in real world distance, so zooming out does not
+           uncover more) and the icon fade distance (how far past that edge
+           an icon keeps fading before it disappears).
+           How it looks: fog opacity, "Remember where you walked" with its
+           trail width (Match the peek, or a width of its own) and trail
+           memory, and fog motion (Off / Gentle / Full).
+           With Advanced settings on the tab also gains Mask strength and a
+           Fog diagnostic, which is for bug reports and not a look.
   ICONS    Map icons: the world map's icons on/off (and Edge visibility with
            Advanced settings on).
            Selected category: per-category on/off, discovered-only, size,

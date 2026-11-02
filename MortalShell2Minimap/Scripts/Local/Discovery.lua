@@ -932,6 +932,17 @@ function Factory.New(ctx)
             .. (extra ~= nil and (" " .. tostring(extra)) or ""))
     end
 
+    -- A position breadcrumb whose string is built INSIDE the enabled check. Lua evaluates
+    -- call arguments before the callee runs, so `trace(l, p, string.format(...))` pays for
+    -- the format even when tracing is off -- which it is, by default, in every shipped
+    -- build. This ran up to five times a second per enemy (invariant 0l).
+    local function trace_pos(label, phase, pos)
+        if Config.LocalDiscoveryTrace == false then return end
+        if pos == nil then return trace(label, phase, "pos=none") end
+        return trace(label, phase, string.format("pos=(%.0f,%.0f,%.0f)",
+            tonumber(pos.x) or 0, tonumber(pos.y) or 0, tonumber(pos.z) or 0))
+    end
+
     -- Hot-hook governor (v0.11.7) -------------------------------------------------
     -- The lesson of v0.11.6 is not that PostSpawnMovement was the wrong hook; it is
     -- that nothing in a UFunction's name, signature or neighbours tells you whether
@@ -1313,6 +1324,31 @@ function Factory.New(ctx)
     -- run per AI decision). One location read per enemy per interval caps the cost no
     -- matter how chatty the hook is.
     local ENEMY_REFRESH_INTERVAL = 0.2
+
+    -- THE PLAYER'S ADDRESS, ONCE PER PAWN. v0.23.4.
+    --
+    -- note_enemy used to call Object.Address(state.player) on EVERY raw enemy event, and
+    -- Object.Address is Unwrap, Valid (which Unwraps again), GetAddress and a
+    -- string.format -- four pcalls, two reflection calls and a string allocation, for a
+    -- value that changes only when the pawn is re-resolved (a load or a possession).
+    --
+    -- Keyed on the wrapper itself rather than on a "the player changed" callback, because
+    -- there are four assignment sites and a cache that depends on all four remembering to
+    -- invalidate it is a cache that will be wrong. A fresh wrapper for the same actor
+    -- misses and recomputes, which costs one event and is always correct.
+    local player_key_cache = { wrapper = nil, key = nil }
+
+    local function player_address()
+        local player = state.player
+        if player == nil then
+            player_key_cache.wrapper, player_key_cache.key = nil, nil
+            return nil
+        end
+        if rawequal(player, player_key_cache.wrapper) then return player_key_cache.key end
+        local key = Object.Address(player)
+        player_key_cache.wrapper, player_key_cache.key = player, key
+        return key
+    end
     -- v0.16.3: how often one AI's health component is asked whether it is dead, from
     -- inside the game's own corpse check on that AI.
     local CORPSE_READ_INTERVAL = 2.0
@@ -1498,18 +1534,60 @@ function Factory.New(ctx)
         -- test covers the window where the address is unavailable. A player character is
         -- never an enemy under any circumstance, which makes this belt and braces rather
         -- than a fallback.
-        if state.player ~= nil and owner_key == Object.Address(state.player) then
+        if state.player ~= nil and owner_key == player_address() then
             runtime.metrics.enemy_self_skipped = (runtime.metrics.enemy_self_skipped or 0) + 1
             return
         end
-        local actor_class = Object.ClassShortName(actor)
-        if type(actor_class) == "string" and actor_class:find("PlayerCharacter", 1, true) then
-            runtime.metrics.enemy_self_skipped = (runtime.metrics.enemy_self_skipped or 0) + 1
-            runtime.metrics.enemy_self_by_class = (runtime.metrics.enemy_self_by_class or 0) + 1
-            return
-        end
-        trace(label, "enemy-live", "id=" .. tostring(owner_key))
+
+        -- THE THROTTLE MOVED UP. v0.23.4, and this is the combat fix.
+        --
+        -- The 0.2 s per-enemy throttle used to live 70 lines below, which meant every
+        -- event that it threw away had already paid for Object.ClassShortName -- seven
+        -- pcalls, four reflection calls and a string allocation -- plus a concat built
+        -- for a trace that is off by default.
+        --
+        -- Four crabs stepping four times a second is sixteen events a second, of which
+        -- the throttle keeps about five. The other eleven did all of that work and were
+        -- then discarded, and the wasted fraction grows with the number of enemies. That
+        -- is the term that scales with a fight, and it is why the mod costs more in
+        -- battle than in exploration.
+        --
+        -- Safe, because it only skips work on a record that ALREADY EXISTS AND IS ALREADY
+        -- FLAGGED AN ENEMY. Such a record passed both player tests when it was admitted,
+        -- and an actor cannot become the player afterwards. The admission path below is
+        -- untouched: a new actor still gets the class-name test, which is the one that
+        -- covers the window where state.player is nil (v0.18.25).
         local record = runtime.records[owner_key]
+        if record ~= nil and record.enemy == true then
+            local last_seen = tonumber(record.refreshed_at)
+            if last_seen ~= nil and (os.clock() - last_seen) < ENEMY_REFRESH_INTERVAL then
+                record.seen_at = os.clock()
+                runtime.metrics.enemy_refresh_throttled =
+                    runtime.metrics.enemy_refresh_throttled + 1
+                return
+            end
+        end
+
+        -- ONE class read for the whole admission, not three. v0.23.4.
+        --
+        -- It was resolved here for the player guard, again below for the enemy hint, and
+        -- a third time inside upsert. Object.ClassShortName is seven pcalls, four
+        -- reflection calls and a string allocation each time. A wave of eight enemies
+        -- spawning at the start of a fight paid twenty-four of them instead of eight, in
+        -- the one frame where the game is also spawning eight actors -- which is exactly
+        -- the moment a hitch is noticed.
+        local admit_class = nil
+        if record == nil then
+            admit_class = Object.ClassShortName(actor)
+            if type(admit_class) == "string" and admit_class:find("PlayerCharacter", 1, true) then
+                runtime.metrics.enemy_self_skipped = (runtime.metrics.enemy_self_skipped or 0) + 1
+                runtime.metrics.enemy_self_by_class = (runtime.metrics.enemy_self_by_class or 0) + 1
+                return
+            end
+        end
+        -- Pieces, not a built string: trace() returns on its first line when tracing is
+        -- off, but Lua has already evaluated the arguments (invariant 0l).
+        trace(label, "enemy-live", owner_key)
         if record ~= nil and record.enemy ~= true then
             -- An NPC or interactable already owns this address; leave it alone.
             return
@@ -1520,13 +1598,13 @@ function Factory.New(ctx)
             -- line, which narrowed it to "one of the two reflection calls below" and no
             -- further; a pre-call line names the call itself.
             trace(label, "enemy-classify")
-            local class_name = Object.ClassShortName(actor)
-            trace(label, "enemy-class", "class=" .. tostring(class_name))
+            local class_name = admit_class
+            trace(label, "enemy-class", class_name)
             local hint = enemy_hint(class_name)
             if hint == nil then
                 runtime.metrics.enemy_friendly_skipped =
                     runtime.metrics.enemy_friendly_skipped + 1
-                trace(label, "enemy-friendly", "class=" .. tostring(class_name))
+                trace(label, "enemy-friendly", class_name)
                 return
             end
             record = upsert(source_key("enemy", actor), actor, label, hint)
@@ -1581,8 +1659,10 @@ function Factory.New(ctx)
         runtime.enemy_actors[owner_key] = actor
         trace(label, "enemy-locate")
         local pos = location(actor)
-        trace(label, "enemy-refresh", pos ~= nil and string.format(
-            "pos=(%.0f,%.0f,%.0f)", pos.x or 0, pos.y or 0, pos.z or 0) or "pos=none")
+        -- The format is built INSIDE trace, past its enabled check. This ran per
+        -- serviced refresh, so up to five times a second per enemy, to produce a string
+        -- that is thrown away in a shipped build (invariant 0l).
+        trace_pos(label, "enemy-refresh", pos)
         runtime.metrics.enemy_refreshed = runtime.metrics.enemy_refreshed + 1
         -- v0.18.22 (user, 2026-09-15: "one of the issues we had with enemy tracking was
         -- with flying enemies"). Her 130041 run admitted BP_Batman_C three times and
@@ -1609,12 +1689,32 @@ function Factory.New(ctx)
         local moved_x = (tonumber(record.x) or pos.x) - pos.x
         local moved_y = (tonumber(record.y) or pos.y) - pos.y
         record.x, record.y, record.z = pos.x, pos.y, pos.z
+        -- v0.23.4 THE COMBAT ONE. The pool moves the live marker in place, allocating
+        -- nothing, and tells us whether the SELECTION could have changed -- which it only
+        -- can when the record crosses the visible radius, or when the pool is full and
+        -- the distance ordering decides the last slots.
+        --
+        -- This used to ask for a full re-selection on a flat five-metre delta. In a fight
+        -- something always moves five metres inside the 100 ms coalescing window, so the
+        -- ceiling was the steady state: ten pairs() walks, ten sorts and a fresh target
+        -- table per eligible record per second, all to redraw markers that the in-place
+        -- update had already moved correctly.
+        local moved_far = moved_x * moved_x + moved_y * moved_y >= ENEMY_MOVE_RESYNC_SQ
+        local selection_may_change = false
         if type(ctx.LocalPool) == "table" and type(ctx.LocalPool.UpdateRecordPosition) == "function" then
-            ctx.LocalPool.UpdateRecordPosition(record)
+            local _, may_change = ctx.LocalPool.UpdateRecordPosition(record)
+            selection_may_change = may_change == true
+        else
+            -- No pool to ask: fall back to the old distance rule rather than never syncing.
+            selection_may_change = moved_far
         end
         state.local_overlay_refresh_requested = true
-        if moved_x * moved_x + moved_y * moved_y >= ENEMY_MOVE_RESYNC_SQ then
-            request_sync("local-enemy-moved")
+        if selection_may_change then
+            runtime.metrics.enemy_resync = (runtime.metrics.enemy_resync or 0) + 1
+            request_sync("local-enemy-range")
+        elseif moved_far then
+            runtime.metrics.enemy_resync_skipped =
+                (runtime.metrics.enemy_resync_skipped or 0) + 1
         end
     end
 
@@ -2052,7 +2152,7 @@ function Factory.New(ctx)
                     if not Object.Valid(actor) then
                         local token = Perf.Begin()
                         local ok, found = pcall(StaticFindObject, record.recheck_path)
-                        Perf.End("native.staticfind", token)
+                        Perf.End("native.find", token)
                         actor = ok and Object.Unwrap(found) or nil
                         runtime.metrics.secret_recheck_resolves =
                             runtime.metrics.secret_recheck_resolves + 1
@@ -2120,14 +2220,34 @@ function Factory.New(ctx)
         local tracked, looked, moved = 0, 0, 0
         -- Ordered keys, so the cursor means the same thing between ticks: pairs() order
         -- is not stable across insertions and a cursor into it would skip records.
-        local keys = {}
-        for owner_key, record in pairs(runtime.records) do
-            if record.enemy == true and runtime.enemy_actors[owner_key] ~= nil then
-                keys[#keys + 1] = owner_key
+        -- v0.23.4: iterate the ENEMY table, not every record, and reuse one array.
+        --
+        -- This walked all of runtime.records -- interactables, walls, NPCs, everything --
+        -- allocated a fresh keys table, grew it one element at a time and string-sorted
+        -- hex addresses, twice a second, to perform at most ENEMY_POLL_BUDGET reads. The
+        -- comment above says "a room full of enemies costs exactly the same per tick as
+        -- one enemy", which is true of the budget and the native reads and was not true of
+        -- the tick, which was O(all records + E log E) with an allocation. In this project
+        -- the comment is the contract, so the code now matches it.
+        --
+        -- runtime.enemy_actors is keyed by exactly the set this loop was filtering for, so
+        -- the record lookup confirms rather than searches. The array is kept on runtime
+        -- and truncated rather than replaced, so a fight allocates nothing here.
+        local keys = runtime.enemy_poll_keys
+        if keys == nil then keys = {}; runtime.enemy_poll_keys = keys end
+        local n = 0
+        for owner_key in pairs(runtime.enemy_actors) do
+            local record = runtime.records[owner_key]
+            if record ~= nil and record.enemy == true then
+                n = n + 1
+                keys[n] = owner_key
             end
         end
-        tracked = #keys
+        for index = #keys, n + 1, -1 do keys[index] = nil end
+        tracked = n
         if tracked == 0 then return end
+        -- Sorted so the resuming cursor walks a stable order across ticks; with the set
+        -- built from enemy_actors this is the only remaining per-tick cost here.
         table.sort(keys)
         local start = 1
         if runtime.enemy_poll_cursor ~= nil then
@@ -2171,14 +2291,28 @@ function Factory.New(ctx)
                             local moved_x = (tonumber(record.x) or pos.x) - pos.x
                             local moved_y = (tonumber(record.y) or pos.y) - pos.y
                             record.x, record.y, record.z = pos.x, pos.y, pos.z
+                            -- Same rule as the hook path above (v0.23.4): the pool moves
+                            -- the marker in place and says whether the SELECTION could
+                            -- have changed. A flying enemy circling inside the radius
+                            -- needs no re-selection, only a new position.
+                            local poll_may_change = false
                             if type(ctx.LocalPool) == "table"
                                 and type(ctx.LocalPool.UpdateRecordPosition) == "function" then
-                                ctx.LocalPool.UpdateRecordPosition(record)
+                                local _, may_change = ctx.LocalPool.UpdateRecordPosition(record)
+                                poll_may_change = may_change == true
+                            else
+                                poll_may_change =
+                                    moved_x * moved_x + moved_y * moved_y >= ENEMY_MOVE_RESYNC_SQ
                             end
                             state.local_overlay_refresh_requested = true
-                            if moved_x * moved_x + moved_y * moved_y >= ENEMY_MOVE_RESYNC_SQ then
+                            if poll_may_change then
                                 moved = moved + 1
-                                request_sync("local-enemy-polled")
+                                runtime.metrics.enemy_resync =
+                                    (runtime.metrics.enemy_resync or 0) + 1
+                                request_sync("local-enemy-range")
+                            elseif moved_x * moved_x + moved_y * moved_y >= ENEMY_MOVE_RESYNC_SQ then
+                                runtime.metrics.enemy_resync_skipped =
+                                    (runtime.metrics.enemy_resync_skipped or 0) + 1
                             end
                             -- Counted per class beside the hook-driven refreshes, so the
                             -- summary shows at a glance which classes only move because
@@ -2887,7 +3021,7 @@ function Factory.New(ctx)
             spent = spent + 1
             local token = Perf.Begin()
             local ok, found = pcall(StaticFindObject, class_path)
-            Perf.End("native.findobject", token)
+            Perf.End("native.find", token)
             runtime.metrics.arm_lookups = runtime.metrics.arm_lookups + 1
             local present = (ok and Object.Valid(found)) and true or false
             if present then runtime.class_present[class_path] = true
@@ -2939,12 +3073,24 @@ function Factory.New(ctx)
         for index = resume_at, #HOOK_SPECS do
             local spec = HOOK_SPECS[index]
             if out_of_budget() then stopped_at = index break end
+            local spec_started = os.clock()
             -- v0.18.22: and stop on TIME too. `index > resume_at` guarantees at least one
             -- spec per pass, so the cursor always advances and the chain always ends --
             -- the thing v0.18.14 got wrong. An explicit budget ("I need the answer now")
             -- still pays whatever it costs rather than returning a half-armed answer.
+            -- v0.23.57: PREDICT, do not react. This check ran before each spec but
+            -- compared only the time ALREADY spent, so a pass stopped at 10 ms and then
+            -- paid for one more RegisterHook on top of it. Her 2026-09-17 session:
+            -- avg 18.25 ms against this 10 ms budget, max 47. At 77 fps a frame is 13 ms,
+            -- so every slice was a dropped frame -- "a hitch every 2-3 seconds".
+            --
+            -- Adding what a spec actually costs, learned and decayed, keeps the pass
+            -- inside its budget instead of one item past it. `index > resume_at` still
+            -- guarantees at least one spec per pass, so the cursor always advances and
+            -- the chain always terminates.
             if budget == nil and index > resume_at
-                and (os.clock() - started) * 1000.0 >= ARM_TIME_SLICE_MS then
+                and (os.clock() - started) * 1000.0
+                    + (runtime.arm_spec_cost_ms or 0.0) >= ARM_TIME_SLICE_MS then
                 runtime.metrics.arm_time_slices = runtime.metrics.arm_time_slices + 1
                 stopped_at = index
                 break
@@ -2998,6 +3144,12 @@ function Factory.New(ctx)
                 end
             end
             if runtime.hooks[spec.path] ~= nil then armed = armed + 1 end
+            -- v0.23.57: what this spec actually cost, for the prediction at the top of
+            -- the next iteration. Decayed rather than kept as a high-water mark, so one
+            -- expensive RegisterHook cannot shut the slice down for the rest of the world.
+            local spec_cost = (os.clock() - spec_started) * 1000.0
+            local known = runtime.arm_spec_cost_ms or 0.0
+            runtime.arm_spec_cost_ms = spec_cost > known and spec_cost or (known * 0.90)
         end
         -- v0.16.0: construction notifications for the wall families, retried exactly
         -- like the hooks (UE4SS resolves the class at registration, so a class the game
@@ -3158,6 +3310,10 @@ function Factory.New(ctx)
         runtime.class_absent = {}
         runtime.class_absent_clears = 0
         runtime.arm_cursor = nil
+        -- v0.23.57: the learned per-spec cost belongs to the world that measured
+        -- it. A new world reloads different classes, and carrying a stale estimate
+        -- across would either waste budget or stop the slice short for no reason.
+        runtime.arm_spec_cost_ms = nil
         runtime.walls_were_armed = false
         runtime.arm_continue_pending = false
         runtime.metrics.arm_lookups = 0

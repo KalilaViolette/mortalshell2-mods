@@ -323,6 +323,17 @@ function Factory.New(ctx)
     view.ApplyPostProcess = apply_post_process
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)
@@ -684,7 +695,15 @@ function Factory.New(ctx)
     -- it reads and writes their properties through exactly the UE4SS reflection path that
     -- faults at +0x36562e. These name the step. Same flag as the discovery breadcrumbs.
     local function crumb(step, extra)
-        if Config.LocalDiscoveryTrace ~= true then return end
+        -- v0.23.43: TraceHotPaths, not LocalDiscoveryTrace. MEASURED over her 502 s
+        -- session: this family alone printed 58,620 lines, 117 per second, and the
+        -- crash hunt these were written for is done. Invariant 0l -- a diagnostic
+        -- is held to the same performance rules as the thing it diagnoses -- and a
+        -- per-frame print on the pose path fails that now it has stopped earning
+        -- its keep. The scheduler and Tick stage crumbs stay on the old flag
+        -- because they are 1% of the volume and they are what is currently
+        -- instrumenting the OPEN death-and-reload crash.
+        if Config.TraceHotPaths ~= true then return end
         log("Dungeon crumb step=" .. tostring(step)
             .. (extra ~= nil and (" " .. tostring(extra)) or ""))
     end

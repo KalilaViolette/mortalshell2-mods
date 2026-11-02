@@ -49,6 +49,11 @@
 local Factory = {}
 
 local SPIKE_MS = 2.0
+-- How many of the heaviest sections ride along in the digest (see perf.Emit). Five is
+-- what fits on a results line and, sorted by interval milliseconds, five is enough to
+-- see a choke point: anything below the fifth heaviest section is not what made the
+-- frame late.
+local DIGEST_SECTIONS = 5
 local DEFAULT_INTERVAL_S = 10.0
 local MAX_SECTIONS = 512
 
@@ -213,6 +218,31 @@ function Factory.New(options)
             perf.section_count, #active, quiet, fmt_ms(total_in_ms),
             (total_in_ms / (since * 1000.0)) * 100.0, total_in_n, SPIKE_MS,
             perf.dropped_sections))
+        -- v0.23.3 DIGEST. The same numbers, on one line, returned rather than logged.
+        --
+        -- Her instruction, 2026-09-17: "while you're doing each of these game launches ...
+        -- it would be a great opportunity for you to measure and iron out performance and
+        -- choke points." The log already carries all of this, but reading it means pulling
+        -- a UE4SS log off her machine and finding the right interval in it, which is why
+        -- it has been done twice in a month. A digest returned from the same call goes
+        -- straight into the test runner's own results file, so every launch leaves numbers
+        -- behind whether or not anyone goes looking.
+        --
+        -- Built from the SAME `active` list that was just sorted and before the counters
+        -- are cleared below, so it can never disagree with the log lines. No second pass,
+        -- no second reset, and nothing extra computed when nobody asked for a digest --
+        -- Emit was already doing all of this work.
+        local digest_parts = {
+            string.format("intervalS=%.1f busyPct=%.2f totalMs=%s events=%d active=%d dropped=%d",
+                since, (total_in_ms / (since * 1000.0)) * 100.0, fmt_ms(total_in_ms),
+                total_in_n, #active, perf.dropped_sections),
+        }
+        for i = 1, math.min(DIGEST_SECTIONS, #active) do
+            local s = perf.sections[active[i]]
+            digest_parts[#digest_parts + 1] = string.format("%s=%s/%d/%s/%d",
+                active[i], fmt_ms(s.in_ms), s.in_n, fmt_ms(s.in_max), s.in_spikes)
+        end
+        local digest = table.concat(digest_parts, " ")
         for _, name in ipairs(active) do
             local s = perf.sections[name]
             local line = string.format(
@@ -229,7 +259,9 @@ function Factory.New(options)
             s.in_gap_n, s.in_gap_ms, s.in_gap_max = 0, 0.0, 0.0
         end
         perf.last_emit_at = now
-        return #active
+        -- Second return, so every existing caller is untouched: Lua discards it.
+        -- Format per section: name=ms/calls/max/spikes.
+        return #active, digest
     end
 
     -- Called from any low-frequency place (a mod's own tick). Emits when the

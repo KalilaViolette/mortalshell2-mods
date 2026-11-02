@@ -966,6 +966,32 @@ function Factory.New(ctx)
         debug_log("Setting " .. tostring(setting.key) .. "=" .. tostring(saved_value) .. " via=" .. tostring(reason or "change"))
     end
 
+    -- v0.23.3. The same path by KEY, so nothing else has to grow its own copy of it.
+    --
+    -- Written because Diagnostics/AutoTest.lua's `apply` verb called a function named
+    -- apply_setting that did not exist anywhere -- a nil global, swallowed by the pump's
+    -- pcall. Every `apply` step in every plan since the verb was added has done nothing,
+    -- silently, and a nine case fog opacity sweep came back five pixel-identical
+    -- screenshots that looked like a failed feature rather than a test that never ran.
+    --
+    -- Routing the runner through THIS function rather than a copy also means a test
+    -- changes a setting exactly the way a person does: normalised, saved to the ini by
+    -- the mod's own writer, then dispatched. That is what makes a value survive the quit
+    -- at the end of a plan and still be in force on the next launch.
+    function runtime.ApplySettingByKey(key, reason)
+        if key == nil then return false, "no key" end
+        key = tostring(key)
+        for _, tab in ipairs(TABS) do
+            for _, setting in ipairs(tab.settings or {}) do
+                if setting.key == key then
+                    apply_setting(setting, reason or "external")
+                    return true
+                end
+            end
+        end
+        return false, "no setting named " .. key
+    end
+
     local function change_setting(direction)
         local setting = selected_setting()
         if type(setting) ~= "table" then return end

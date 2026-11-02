@@ -16,6 +16,8 @@ function Factory.New(ctx)
     local WorkBudget = assert(ctx.WorkBudget,
         "Overlay.ObjectivePool requires Runtime.WorkBudget")
     local log = assert(ctx.Log, "Overlay.ObjectivePool requires Log")
+    -- Core/Timeline.lua, soft (see Runtime/Lifecycle.lua for why).
+    local Timeline = ctx.Timeline or { Stamp = function() end }
     local Perf = type(ctx.Perf) == "table" and ctx.Perf
         or { Begin = function() return nil end, End = function() end, Count = function() end }
     local unwrap, valid = Object.Unwrap, Object.Valid
@@ -29,7 +31,20 @@ function Factory.New(ctx)
     local POSITION_EPSILON_SQ = 0.001 * 0.001
     local CONSTRUCTION_BATCH = 4
     local CONSTRUCTION_DELAY_MS = 50
-    local ASSET_DELAY_MS = 30
+    -- v0.23.4: a BUDGET, not a fixed one-per-timer. Measured on her machine, the local
+    -- sweep cost 244 ms over 30 scheduled steps -- 8 ms of work per step and 30 ms of
+    -- waiting between them, so nearly a second of wall clock to resolve 45 textures that
+    -- together cost a quarter of that. The delay was sized for the worst case (a texture
+    -- that needs a disk load) and paid on every case, including the resident ones that
+    -- take a fraction of a millisecond.
+    --
+    -- Now each step keeps resolving until it has spent ASSET_BUDGET_MS, then yields for
+    -- one frame instead of one-and-a-half. Residents fly through many per step; a real
+    -- load takes its step alone and yields immediately after. Same per-frame ceiling,
+    -- roughly half the wall clock, and it self-tunes to her machine rather than to a
+    -- number somebody picked.
+    local ASSET_DELAY_MS = 16
+    local ASSET_BUDGET_MS = 8.0
 
     local runtime = {}
     state.objective_pool = state.objective_pool or {
@@ -37,7 +52,16 @@ function Factory.New(ctx)
         by_record = {},
         pending_targets = {},
         assets = {},
+        -- v0.23.46: path -> { keeper = our collapsed UImage, texture = the wrapper it
+        -- owns }. Without this pool.assets was a plain Lua table of textures with no
+        -- owner in the engine's object graph, and valid() on a collected one is fatal.
+        pinned = {},
         asset_status = {},
+        -- v0.23.57: what one asset load has been costing, so a step can stop
+        -- BEFORE one that will not fit its budget. Decayed, never a permanent
+        -- high-water mark, and dropped with the assets on a world change because
+        -- a new world's textures are a different disk.
+        asset_step_cost_ms = 0.0,
         ready = false,
         dependency_started = false,
         build_blocked = false,
@@ -105,6 +129,17 @@ function Factory.New(ctx)
     end
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)
@@ -136,6 +171,36 @@ function Factory.New(ctx)
         local value = nil
         if key ~= nil then value = Config[key] end
         if value == nil then return fallback end
+        return value
+    end
+
+    -- v0.23.5. This pool has only ever had visibility, never opacity -- it did not need
+    -- one until icons had to FADE in through fog rather than appear at a boundary.
+    -- Written only on a change, like every other property write in this file.
+    local function set_item_opacity(item, opacity)
+        if item.opacity == opacity then return true end
+        local image = item.refs.image
+        if not valid(image) then return false end
+        if pcall(image.SetRenderOpacity, image, opacity) then
+            item.opacity = opacity
+            pool.metrics.opacity_writes = (pool.metrics.opacity_writes or 0) + 1
+            return true
+        end
+        return false
+    end
+
+    -- v0.23.39. The fog layer owns the number; this only asks. 1.0 when fog is off,
+    -- suppressed in a dungeon, or unavailable, so a player with fog off sees exactly what
+    -- this pool has always shown.
+    local function fog_visibility(world_x, world_y)
+        if type(ctx.Fog) ~= "table" or type(ctx.Fog.MarkerVisibility) ~= "function" then
+            return 1.0
+        end
+        local ok, value = pcall(ctx.Fog.MarkerVisibility, world_x, world_y)
+        if not ok then return 1.0 end
+        value = tonumber(value)
+        if value == nil then return 1.0 end
+        if value < 0.0 then return 0.0 elseif value > 1.0 then return 1.0 end
         return value
     end
 
@@ -182,6 +247,58 @@ function Factory.New(ctx)
         set_visible(item, false)
     end
 
+    -- THE OBJECTIVE ICONS HAD NO OWNER. v0.23.46, and it is invariant 0x for the fourth
+    -- time today.
+    --
+    -- HER CRASH, and the crumbs that found it. v0.23.44 bracketed every engine call in
+    -- construct_entry, and her next trail came back with every family BALANCED at 238/238
+    -- and the log ending on "c-done" for entry 66. So construction completes and is
+    -- exonerated -- the instrument proved the innocence of the thing it instrumented.
+    --
+    -- That left exactly one uncrumbed span: what runs after construct_entry returns and
+    -- before the next c-guard. Reading it, the only engine work in there is assign_target,
+    -- and assign_target's FIRST engine-touching line is valid(texture) on pool.assets.
+    --
+    -- pool.assets is a plain Lua table of LoadAsset'd textures held across frames with NO
+    -- owner in the engine's object graph. Overlay/LocalPool.lua has pinned its icons into
+    -- keeper Images since v0.10.14 and Map/FogLayer.lua learned the same lesson three
+    -- times today; this pool never did. valid() on a collected wrapper is FATAL rather
+    -- than false, which is why the signature is an access violation reading 0x40 in a
+    -- SAFETY CHECK, and why it lands after a fast travel or a death reload: those are
+    -- where the collector runs.
+    --
+    -- It also explains the shape exactly. 238 constructions succeed because construction
+    -- never touches pool.assets; the first assign_target after the collection dies.
+    --
+    -- Same keeper pattern as LocalPool's pin_texture, deliberately not a shared helper:
+    -- the two pools own different widget trees and different image classes, and merging
+    -- them would be a second change riding along with a crash fix.
+    local function pin_asset(path, texture)
+        if texture == nil or pool.pinned[path] ~= nil then return false end
+        local frame = state.retained and state.retained.frame or nil
+        if not valid(frame) or not valid(pool.image_class) then return false end
+        local keeper = nil
+        local ok = pcall(function()
+            keeper = unwrap(StaticConstructObject(pool.image_class, frame,
+                make_name("ObjectiveIconKeeper")))
+            assert(valid(keeper), "objective keeper image construction failed")
+            local slot = unwrap(frame:AddChildToCanvas(keeper))
+            assert(valid(slot), "objective keeper slot failed")
+            slot:SetPosition({ X = -10000, Y = -10000 })
+            slot:SetSize({ X = 1, Y = 1 })
+            keeper:SetVisibility(VIS_COLLAPSED)
+            keeper:SetBrushFromTexture(texture, false)
+        end)
+        if not ok then
+            if keeper ~= nil and valid(keeper) then pcall(keeper.RemoveFromParent, keeper) end
+            pool.metrics.pin_failures = (pool.metrics.pin_failures or 0) + 1
+            return false
+        end
+        pool.pinned[path] = { keeper = keeper, texture = texture }
+        pool.metrics.pins = (pool.metrics.pins or 0) + 1
+        return true
+    end
+
     local function assign_target(item, target)
         local changed = type(item.target) ~= "table"
             or item.target.record_id ~= target.record_id
@@ -210,25 +327,96 @@ function Factory.New(ctx)
         return true
     end
 
+    -- SPLITTING THE SLICE. v0.23.41.
+    --
+    -- Her death-and-reload crash on v0.23.39 ends at "Work crumb step=objective.build-slice"
+    -- with no -done, 0.3 ms after "Loading screen completed". 128 slices finished, the
+    -- 129th died. v0.23.38's scheduler crumbs did their job and named the slice.
+    --
+    -- But invariant 0y says a crumb names a REGION when more than one engine call sits
+    -- behind it, and this slice does two unrelated things: it CONSTRUCTS widgets, and then
+    -- it calls runtime.UpdatePlayer over every entry. Those fail for different reasons and
+    -- would need different fixes, so they get different crumbs rather than a guess.
+    --
+    -- Why UpdatePlayer is newly interesting at exactly this moment: state.map_center_world_x
+    -- is written on the pose path, and the pose path does not run while the loading screen
+    -- has the map hidden. So for all 128 earlier slices UpdatePlayer was handed nil and
+    -- returned immediately. The first slice after the map became visible is the first one
+    -- that ever walked the entries in this world.
+    local function slice_crumb(name)
+        if Config.LocalDiscoveryTrace == true then
+            print("[MortalShell2Minimap] Objective crumb step=" .. tostring(name) .. "\n")
+        end
+    end
+
+    -- INSIDE THE CONSTRUCTION, ONE ENGINE CALL AT A TIME. v0.23.44.
+    --
+    -- v0.23.41 split the slice and it worked on the first try: her fast-travel crash on
+    -- v0.23.42 ends at "Objective crumb step=construct" with no -done, and the slice
+    -- before it reads "update-player x=nil y=nil entries=64" -- which also confirms the
+    -- prediction that UpdatePlayer is handed nil during a load and returns at once. So it
+    -- is the construction, not the update.
+    --
+    -- Two theories died on the way here, both of which looked obvious:
+    --   1. "The slice does not guard on state.built, so the frame is a dead wrapper."
+    --      DEAD: DropWorldReferencesUnread sets state.retained = {} as well as
+    --      state.built = false, so frame is NIL after a world drop, and valid(nil) is
+    --      false rather than fatal.
+    --   2. "Fast travel tore the tree down under it." DEAD: her log has a complete
+    --      rebuild at 12:15:39.51 ("Ready nativeTiles=true"), 3.4 SECONDS before the
+    --      crash. The frame was alive.
+    --
+    -- So "construct" is still a region -- two valid() checks, a StaticConstructObject, an
+    -- AddChildToCanvas and the property writes -- and invariant 0y says name the call
+    -- before fixing anything. These crumbs carry the entry INDEX, because "it dies on the
+    -- first one" and "it dies on the sixty-fifth" are different bugs.
     local function construct_entry()
+        local index = #pool.entries + 1
+        slice_crumb("c-guard n=" .. tostring(index))
         local frame = state.retained and state.retained.frame or nil
         if not valid(frame) or not valid(pool.image_class) then
             return nil, "renderer-frame-or-image-class-unavailable"
         end
-        local index = #pool.entries + 1
+        slice_crumb("c-guard-done")
         local refs = {}
         local ok, build_error = pcall(function()
+            slice_crumb("c-new")
             local image = unwrap(StaticConstructObject(
                 pool.image_class, frame, make_name("Objective" .. tostring(index))))
+            slice_crumb("c-new-done")
             assert(valid(image), "objective image construction failed index=" .. tostring(index))
             refs.image = image
+            slice_crumb("c-slot")
             local slot = unwrap(frame:AddChildToCanvas(image))
+            slice_crumb("c-slot-done")
             assert(valid(slot), "objective slot failed index=" .. tostring(index))
             refs.slot = slot
             slot:SetPosition({ X = -10000, Y = -10000 })
             slot:SetSize({ X = 1, Y = 1 })
-            pcall(slot.SetZOrder, slot, 4)
+            -- ABOVE THE FOG. v0.23.31.
+            --
+            -- HER REPORT: "I can't see icons inside of my peek hole or trail behind me,
+            -- like enemies, items, etc. poi markers and local markers both. The only icon
+            -- i do see rendered is the height indicator."
+            --
+            -- She is right and the Z orders say so plainly. The fog is layer A at 4 and
+            -- layer B at 5 (Map/NativeWidget.lua), and these markers were sitting at 3, 4
+            -- and 5 -- level with the fog or beneath it. Fog became default-ON in v0.23.x
+            -- and quietly buried every marker with it; the height chevrons survived only
+            -- because they happened to be parented higher.
+            --
+            -- Markers belong ON TOP of the fog, which is also her instruction: "they can
+            -- sit on top like the elevation arrows do". What a marker means -- here is a
+            -- thing, and how far away it is -- is not something fog should be able to
+            -- swallow. Whether a marker should DIM with fog depth is a separate question
+            -- and a separate change; this one only stops them being hidden outright.
+            --
+            -- Kept below Z_ARROW (10) so the player marker still wins, and below the
+            -- labels (59/60) which have always drawn above everything.
+            pcall(slot.SetZOrder, slot, 7)
+            slice_crumb("c-visibility")
             image:SetVisibility(VIS_COLLAPSED)
+            slice_crumb("c-done")
         end)
         if not ok then
             if valid(refs.image) then pcall(refs.image.RemoveFromParent, refs.image) end
@@ -280,6 +468,7 @@ function Factory.New(ctx)
         pool.metrics.entries_examined = pool.metrics.entries_examined + 1
         local delta_x = target.x - player_x
         local delta_y = target.y - player_y
+
         if target.broad_phase_revision ~= context.range_revision then
             target.broad_phase_radius_sq = Projection.RelevantRadiusSquared(
                 context, presentation.marker_radius_pixels,
@@ -292,6 +481,22 @@ function Factory.New(ctx)
             set_mode(item, Projection.MODE_HIDDEN, false)
             set_visible(item, false)
             return true
+        end
+        -- v0.23.39. Only sight_only targets pay for this, so the common case -- a
+        -- discovered POI, or any POI with fog off -- costs one boolean test. Culled
+        -- before the projection, like the broad phase above it.
+        if target.sight_only == true then
+            local seen = fog_visibility(target.x, target.y)
+            if seen <= 0.0 then
+                set_mode(item, Projection.MODE_HIDDEN, false)
+                set_visible(item, false)
+                return true
+            end
+            set_item_opacity(item, seen)
+        elseif item.opacity ~= nil and item.opacity ~= 1.0 then
+            -- It stopped being sight-only (she discovered it, or turned fog off) and is
+            -- still carrying the last fade it was drawn at. One write, once.
+            set_item_opacity(item, 1.0)
         end
         pool.metrics.projections_executed = pool.metrics.projections_executed + 1
         local x, y, _, _, standard_inside, display_visible, _, _, mode,
@@ -396,10 +601,33 @@ function Factory.New(ctx)
         if pool.build_token ~= token or state.world_quarantined
             or type(state.poi) ~= "table" or state.poi.generation ~= generation then return end
         local started, built = os.clock(), 0
+        slice_crumb("construct")
         while built < CONSTRUCTION_BATCH and #pool.pending_targets > 0
             and #pool.entries < capacity() do
             local item, build_error = construct_entry()
             if item == nil then
+                -- v0.23.5. "NOT YET" IS NOT "NEVER", and conflating them cost every POI
+                -- icon on the map.
+                --
+                -- construct_entry returns this reason when the widget tree is mid-rebuild:
+                -- state.retained.frame is replaced wholesale at the END of Build(), so for
+                -- the moment in between there is no frame to parent an Image to. That is a
+                -- transient state and the correct response is to come back next slice.
+                --
+                -- It used to latch build_blocked instead, and build_blocked is cleared
+                -- ONLY by a world change -- so one unlucky slice during a rebuild removed
+                -- every objective icon for the rest of the session, with no way back
+                -- except reloading the game. Measured on her machine 2026-09-17:
+                -- "desired=169 active=169 built=0 pending=169 buildFailures=1", three
+                -- screenshots with no icons at all, and the fog filter wrongly suspected
+                -- first because it was the newest thing.
+                --
+                -- This was always latent. Cutting the world-release settle from 5000 ms to
+                -- 250 made it easy to hit, because builds now land in a busier window.
+                if build_error == "renderer-frame-or-image-class-unavailable" then
+                    pool.metrics.build_deferrals = (pool.metrics.build_deferrals or 0) + 1
+                    break
+                end
                 pool.build_blocked = true
                 pool.metrics.build_failures = pool.metrics.build_failures + 1
                 log("Objective pool construction stopped: " .. tostring(build_error)
@@ -413,12 +641,26 @@ function Factory.New(ctx)
             end
             built = built + 1
             pool.metrics.images_constructed = pool.metrics.images_constructed + 1
+            -- First icon of this load. Stamp() on a key it already holds returns at once,
+            -- so this costs one table index per icon built and nothing at all once the
+            -- line has been reported.
+            Timeline.Stamp("poi_first_icon")
         end
         local elapsed = (os.clock() - started) * 1000.0
         pool.metrics.build_cpu_ms = pool.metrics.build_cpu_ms + elapsed
         pool.metrics.max_build_slice_ms = math.max(pool.metrics.max_build_slice_ms, elapsed)
         if built > 0 then pool.metrics.builds = pool.metrics.builds + 1 end
+        slice_crumb("construct-done")
+        -- Crumbed with the arguments, because "UpdatePlayer was called with nil" and
+        -- "UpdatePlayer was called and died" are the two readings this whole round is
+        -- about, and the log should not need me to infer which.
+        slice_crumb("update-player x=" .. tostring(state.map_center_world_x)
+            .. " y=" .. tostring(state.map_center_world_y)
+            .. " entries=" .. tostring(#pool.entries))
         runtime.UpdatePlayer(state.map_center_world_x, state.map_center_world_y)
+        slice_crumb("update-player-done")
+        -- Re-armed whether the slice built anything or deferred: a deferral that did not
+        -- reschedule would be the same permanent stall wearing a different name.
         if #pool.pending_targets > 0 and not pool.build_blocked then
             WorkBudget.Schedule(CONSTRUCTION_DELAY_MS, function()
                 if pool.build_token == token and not state.world_quarantined
@@ -441,7 +683,65 @@ function Factory.New(ctx)
         end
         local discovery_mode = tostring(category.discovery_mode or "only")
         local discovered = record.visible == true or record.revealed == true
-        if discovery_mode == "only" then
+
+        -- FOG SHOWS DISCOVERED POIs ONLY. v0.23.5, her decision 2026-09-17:
+        -- "while in fog it only displays discovered poi, the discover poi can still use
+        -- edge of frame, and we will always show user pins and death spoils."
+        --
+        -- This supersedes the design doc, which said fog would remove edge indicators
+        -- entirely. It does not: an edge arrow for a POI you have already discovered gives
+        -- nothing away, so the arrows stay and the FILTER does the work.
+        --
+        -- Fog forces DiscoveredOnly on for every category that has the setting at all,
+        -- whatever the player set it to -- an undiscovered marker sitting on top of fog is
+        -- the fog telling you what it is hiding. The two always-visible families need
+        -- nothing here: death spoils and small beacons carry discovery_mode = "none" and
+        -- never reach this branch, and user pins are the TrackerPool, a different module
+        -- with no discovery gate of any kind.
+        --
+        -- The per-category setting is not overwritten, only overridden while fog is on, so
+        -- turning fog off gives every category back exactly what she chose.
+        local fog_on = type(ctx.Fog) == "table" and type(ctx.Fog.Enabled) == "function"
+            and ctx.Fog.Enabled() == true
+
+        -- v0.23.39 SUPERSEDES THE PARAGRAPH ABOVE, and it is her spec of 2026-09-17:
+        -- "POI under the icons tab, if it can be discovered only then enforce it, the
+        -- exception is user pins and death spoils. If it can be discovered hidden and it
+        -- hasn't been discovered then it shouldn't be shown unless you're within reveal
+        -- distance. If it can't be discovered hidden and it hasn't been discovered then
+        -- it will be the same thing, won't be shown until within reveal distance."
+        --
+        -- So the two discovery modes stop disagreeing about the undiscovered case. With
+        -- fog on, whatever the mode:
+        --   DISCOVERED   -> shown, and EXEMPT from the fog fade. Her words: "Exempt,
+        --                   still follow frame edge fading logic just like if you were
+        --                   not in a fogged area." A discovered POI is map knowledge, not
+        --                   eyesight, so edge indicators keep working at any range.
+        --   UNDISCOVERED -> sight only: shown within the reveal radius and the trail, at
+        --                   fog opacity, and not at all beyond it.
+        --
+        -- What CHANGED in each direction, because it is not symmetric:
+        --   "only" categories (Hub, Dungeon, EvilStatue, MapStation) previously had
+        --   DiscoveredOnly FORCED on by fog, so an undiscovered one was hidden even while
+        --   she stood on top of it. That is now a reveal-distance rule instead: walk into
+        --   it and you see it.
+        --   "hidden" categories (Shell, Sidearm, Weapon) had no fog rule at all, so an
+        --   undiscovered pickup drew map-wide through the fog. That was the leak behind
+        --   "too many icons showing up in the fog", and it is closed.
+        --
+        -- Untouched: DiscoveredHidden still hides a pickup once she has taken it, which
+        -- is a different question from what fog conceals. And categories with no
+        -- discovery concept at all -- death spoils, small beacons -- never enter this
+        -- branch, exactly as before; user pins are TrackerPool and have no gate anywhere.
+        local sight_only = false
+        if fog_on then
+            if discovery_mode ~= "none" and not discovered then sight_only = true end
+            if discovery_mode == "hidden" then
+                local discovered_hidden = config_value(
+                    category, "DiscoveredHidden", category.discovery_default == true) == true
+                if discovered_hidden and discovered then return nil end
+            end
+        elseif discovery_mode == "only" then
             local discovered_only = config_value(category, "DiscoveredOnly",
                 category.discovery_default == true) == true
             if discovered_only and not discovered then return nil end
@@ -449,6 +749,11 @@ function Factory.New(ctx)
             local discovered_hidden = config_value(
                 category, "DiscoveredHidden", category.discovery_default == true) == true
             if discovered_hidden and discovered then return nil end
+        end
+        -- A marker the fog has fully hidden is not built at all. Checked here, in the
+        -- same pass that already has the record, rather than per frame in the update.
+        if sight_only and fog_visibility(record.world_x, record.world_y) <= 0.0 then
+            return nil
         end
         if category.hide_when_completed == true and record.completed == true then
             return nil
@@ -463,6 +768,11 @@ function Factory.New(ctx)
         end
         local base_size = math.max(16, math.floor(tonumber(
             config_value(category, "IconSize", category.size)) or category.size))
+        -- EDGE INDICATORS STAY ON UNDER FOG. Her decision, 2026-09-17, superseding the
+        -- design doc's "with fog on there are no edge-of-frame icons at all": that idea
+        -- was dropped. A POI that fog lets you see at all is a POI you have discovered,
+        -- and an edge indicator for something you already know about gives nothing away.
+        -- The filtering is done by DISCOVERY, below, not by hiding the arrows.
         local edge_enabled = config_value(
             category, "EdgeIndicators", category.edge) == true
         local edge_max_distance = tonumber(config_value(
@@ -472,6 +782,10 @@ function Factory.New(ctx)
         local base_width, base_height = IconResolver.FitSize(texture_path, base_size)
         if base_width == nil or base_height == nil then return nil end
         local presentation_signature = table.concat({
+            -- v0.23.39: in the signature so that discovering a POI, which flips it from
+            -- sight-only to exempt, counts as a presentation change rather than a target
+            -- that merely looks the same as the one already on screen.
+            tostring(sight_only),
             tostring(base_size), tostring(edge_enabled),
             tostring(edge_max_distance), tostring(edge_min_scale),
             tostring(base_width), tostring(base_height),
@@ -484,6 +798,10 @@ function Factory.New(ctx)
             category_index = category.index,
             texture_path = texture_path,
             completed = record.completed == true,
+            -- v0.23.39. True only for an UNDISCOVERED POI under fog: the one family whose
+            -- presence is eyesight rather than map knowledge, and so the only one the fog
+            -- fade touches. A discovered POI never carries this and is never faded.
+            sight_only = sight_only,
             presentation_signature = presentation_signature,
             presentation = {
                 base_size = base_size,
@@ -588,33 +906,72 @@ function Factory.New(ctx)
             for _, path in ipairs(paths) do
                 if valid(pool.assets[path]) then available = available + 1 end
             end
+            Timeline.Stamp("poi_assets")
             log(string.format(
                 "Objective pool assets ready exact=%d/%d failures=%d cap=%d slicedLoads=true cdoReads=0 softWrapperReads=0",
                 available, #paths, pool.metrics.asset_failures, capacity()))
             runtime.SyncObjectives(type(state.poi) == "table" and state.poi.records or nil)
             return
         end
-        local path = paths[index]
-        local started = os.clock()
-        local asset, status = load_exact_asset(path)
-        local elapsed = (os.clock() - started) * 1000.0
-        pool.metrics.asset_attempts = pool.metrics.asset_attempts + 1
-        pool.metrics.asset_cpu_ms = pool.metrics.asset_cpu_ms + elapsed
-        pool.assets[path] = asset
-        pool.asset_status[path] = status
-        if status == "resident" then
-            pool.metrics.asset_resident = pool.metrics.asset_resident + 1
-        elseif status == "loaded" then
-            pool.metrics.asset_loaded = pool.metrics.asset_loaded + 1
-        else
-            pool.metrics.asset_failures = pool.metrics.asset_failures + 1
-        end
+        -- As many as fit in ASSET_BUDGET_MS, not exactly one. See the constant above:
+        -- the 30 ms delay was sized for a texture that needs a disk load and was paid on
+        -- every texture, including the resident ones that cost a fraction of a
+        -- millisecond. Residents now fly through many per step and a real load takes its
+        -- step alone. Same per-frame ceiling, roughly half the wall clock.
+        local step_started = os.clock()
+        -- v0.23.57: PREDICT the next load rather than discovering afterwards that it did
+        -- not fit. The `until` below tested time ALREADY SPENT, so every step ran to its
+        -- 8 ms budget and then paid for one more load on top -- and "a real load takes its
+        -- step alone" means that one can be twenty milliseconds of disk. Her session
+        -- measured this slice at avg 22.88 ms against the 8 ms budget, max 51, while she
+        -- was feeling "a hitch every 2-3 seconds" at 77 fps (a 13 ms frame).
+        --
+        -- The estimate decays, so one slow texture cannot make every later step timid.
+        -- repeat/until still runs at least one load per step, so the chain always advances
+        -- and the resolve always terminates.
+        local expected = pool.asset_step_cost_ms or 0.0
+        repeat
+            local path = paths[index]
+            local started = os.clock()
+            local asset, status = load_exact_asset(path)
+            local elapsed = (os.clock() - started) * 1000.0
+            pool.metrics.asset_attempts = pool.metrics.asset_attempts + 1
+            pool.metrics.asset_cpu_ms = pool.metrics.asset_cpu_ms + elapsed
+            -- Pinned BEFORE it is stored, so nothing is ever in pool.assets without an
+            -- owner -- not even for one frame, which is all a collection needs.
+            if asset ~= nil then pin_asset(path, asset) end
+            pool.assets[path] = asset
+            pool.asset_status[path] = status
+            if status == "resident" then
+                pool.metrics.asset_resident = pool.metrics.asset_resident + 1
+            elseif status == "loaded" then
+                pool.metrics.asset_loaded = pool.metrics.asset_loaded + 1
+            else
+                pool.metrics.asset_failures = pool.metrics.asset_failures + 1
+            end
+            expected = elapsed > expected and elapsed or (expected * 0.90)
+            index = index + 1
+        until index > #paths
+            or ((os.clock() - step_started) * 1000.0 + expected) >= ASSET_BUDGET_MS
+        pool.asset_step_cost_ms = expected
         WorkBudget.Schedule(ASSET_DELAY_MS, function()
-            resolve_assets_step(paths, index + 1, token, generation)
+            resolve_assets_step(paths, index, token, generation)
         end, "objective.asset-step")
     end
 
     function runtime.OnRendererReady()
+        -- v0.23.5: a NEW widget tree, so whatever blocked construction against the old
+        -- one is not evidence about this one. Cleared before the early return below,
+        -- because on a rebuild `ready` is already true and the early return is the path
+        -- that runs -- which is exactly how a latched block used to survive a rebuild
+        -- that had just fixed the thing it was latched on.
+        if pool.build_blocked then
+            pool.build_blocked = false
+            pool.metrics.build_unblocks = (pool.metrics.build_unblocks or 0) + 1
+            log("Objective pool construction unblocked by a fresh widget tree; "
+                .. tostring(#pool.pending_targets) .. " icon(s) still pending")
+        end
+        if pool.ready and #pool.pending_targets > 0 then arm_pending_build() end
         if pool.dependency_started or pool.ready then return true end
         local frame = state.retained and state.retained.frame or nil
         if not state.built or not valid(frame) then return false end
@@ -668,7 +1025,13 @@ function Factory.New(ctx)
         pool.by_record = {}
         pool.pending_targets = {}
         pool.assets = {}
+        -- The keepers live in the widget tree that is going away, so their pins die with
+        -- it. Keeping the handles would be keeping pointers to objects with no owner --
+        -- exactly the bug this table exists to prevent (Map/FogLayer.lua DropTarget says
+        -- the same thing about its texture cache, for the same reason).
+        pool.pinned = {}
         pool.asset_status = {}
+        pool.asset_step_cost_ms = 0.0
         pool.ready = false
         pool.dependency_started = false
         pool.build_blocked = false
@@ -710,12 +1073,21 @@ function Factory.New(ctx)
         end
         local metrics = pool.metrics
         log(string.format(
-            "Objective pool summary reason=%s ready=%s cap=%d desired=%d active=%d built=%d visible=%d pending=%d overflow=%d categories=%s assets=%d resident=%d loaded=%d assetFailures=%d assetCpuMs=%.3f buildSlices=%d buildFailures=%d buildCpuMs=%.3f maxBuildSliceMs=%.3f syncs=%d syncRequests=%d syncCoalesced=%d positionWrites=%d positionSkips=%d sizeWrites=%d visibilityWrites=%d textureWrites=%d onMapUpdates=%d persistentUpdates=%d hiddenUpdates=%d modeTransitions=%d edgeVisibility=%d%% exactPaths=true directSlots=true",
+            "Objective pool summary reason=%s ready=%s cap=%d desired=%d active=%d built=%d visible=%d pending=%d overflow=%d categories=%s assets=%d resident=%d loaded=%d assetFailures=%d assetPins=%d assetCpuMs=%.3f buildSlices=%d buildFailures=%d buildCpuMs=%.3f maxBuildSliceMs=%.3f syncs=%d syncRequests=%d syncCoalesced=%d positionWrites=%d positionSkips=%d sizeWrites=%d visibilityWrites=%d textureWrites=%d onMapUpdates=%d persistentUpdates=%d hiddenUpdates=%d modeTransitions=%d edgeVisibility=%d%% exactPaths=true directSlots=true",
             tostring(reason or "manual"), tostring(pool.ready), capacity(),
             pool.desired_count, pool.active_count, #pool.entries, visible_count(),
             #pool.pending_targets, pool.overflow_count,
             table.concat(category_text, "|"), metrics.asset_attempts,
             metrics.asset_resident, metrics.asset_loaded, metrics.asset_failures,
+            -- v0.23.53. THE FIX'S OWN COUNTER, WHICH NOTHING EVER PRINTED.
+            --
+            -- v0.23.46 pinned every icon texture through a collapsed keeper -- the fix for
+            -- the fast-travel crash -- and counted every pin into metrics.pins. That number
+            -- went nowhere. So after a clean fast-travel test the evidence was "nothing
+            -- crashed", which is also what a fix that never ran looks like on a run that
+            -- happened not to collect. A fix whose instrument is invisible is a fix nobody
+            -- can confirm, only hope about.
+            metrics.pins or 0,
             metrics.asset_cpu_ms, metrics.builds, metrics.build_failures,
             metrics.build_cpu_ms, metrics.max_build_slice_ms, metrics.syncs,
             metrics.sync_requests, metrics.sync_coalesced,

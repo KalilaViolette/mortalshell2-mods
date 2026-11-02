@@ -159,7 +159,31 @@ end
 local SIZE_VALUES = { 160, 180, 200, 220, 240, 260, 280, 300, 320, 360, 400, 450, 500 }
 local MAP_RANGE_VALUES = { 25, 50, 75, 100, 140, 180, 250, 350, 500, 750, 1000, 1500, 2000, 3000, 5000, 8000, 10000, 15000, 25000, 50000 }
 local ICON_SIZE_VALUES = { 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 48, 56, 64, 80, 96, 112, 128 }
+-- v0.23.47. Local markers are clamped to 48 in Config/Runtime.lua while the shared list
+-- above runs to 128, so this row was offering 56, 64, 80, 96, 112 and 128 and the config
+-- silently rewrote every one of them to 48. Six options that looked like settings and were
+-- not. Found by the round-trip pin added the same day for a different bug, which is the
+-- point of writing general rules rather than fixing the instance in front of you.
+--
+-- The row is narrowed rather than the clamp raised: 48 is a deliberate cap on local marker
+-- size and nothing here is evidence it should move. Raising it would be a behaviour change
+-- riding along with a correctness fix.
+local LOCAL_ICON_SIZE_VALUES = { 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 48 }
 local EDGE_RANGE_VALUES = { 10, 15, 25, 35, 50, 75, 100, 150, 200, 250, 350, 500, 750, 1000, 1500, 2000, 3000, 5000 }
+-- Real world metres. Stops at 300 because the fog stops being a feature long before
+-- that: the smallest map region measures roughly 210 m across, so a reveal radius past
+-- a few hundred metres uncovers whole regions on its own and the map pieces stop
+-- meaning anything.
+-- 28 is the shipped default (her call, 2026-09-17: "Radius needs to be 30% less" against
+-- the 40 it had been). It sits in the list rather than being rounded to 30, because the
+-- default should be the number she asked for and not one near it.
+local FOG_REVEAL_VALUES = { 10, 15, 20, 25, 28, 30, 40, 50, 65, 80, 100, 125, 150, 200, 250, 300 }
+-- v0.23.39. How far past the reveal radius an icon keeps fading before it is gone.
+-- Zero is a hard cut at the edge of the peek circle, which is why it is on the list.
+-- v0.23.42: 7.5 is the default and must therefore be ON this ladder, or the row starts
+-- on a value the player never chose. 2.5 and 12.5 join it so the steps around the
+-- default stay even rather than jumping 5 -> 7.5 -> 10.
+local FOG_MARKER_FADE_VALUES = { 0, 1, 2.5, 5, 7.5, 10, 12.5, 15, 20, 30, 50 }
 local SCALE_VALUES = { 0.20, 0.25, 0.30, 0.35, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00 }
 -- Per-category local icon scale. Reaches above 1.00 because the shared base size is
 -- tuned for interactables and a boss marker legitimately wants to be bigger than one.
@@ -267,8 +291,12 @@ function Factory.New(categories, local_categories, local_art, label_art)
     -- v0.18.0 (user decision 2026-09-14): section headers inside a tab. A header is a
     -- row with no key and no value; the UI never selects it, the ModUI host draws it as
     -- a divider (-- TITLE --), and it is the spacing between one group and the next.
-    local function header(label)
-        return { kind = "header", label = label }
+    -- v0.23.3: a header may be gated exactly like a row. The visible-rows filter in
+    -- UI/ModUI.lua runs over every entry in the list and headers are entries, so this
+    -- needed nothing new -- but without it, hiding a group left its divider behind and
+    -- the FOG tab with fog off would have shown three titles and no settings.
+    local function header(label, hidden)
+        return { kind = "header", label = label, hidden = hidden }
     end
     local tabs = {
         {
@@ -538,6 +566,203 @@ function Factory.New(categories, local_categories, local_art, label_art)
             },
         },
         {
+            -- v0.19.0 (user decision 2026-09-16). Its own tab rather than rows under MAP,
+            -- because fog changes what the map MEANS rather than how it is drawn.
+            key = "FOG", label = "FOG",
+            settings = {
+                header("Fog of war"),
+                {
+                    key = "FogEnabled", label = "Fog",
+                    detail = "Cover the areas you have not discovered yet, using the same map pieces the game's own world map uses. A circle around you stays clear so the minimap is still worth having on.",
+                    -- rebuild, not live. SpartaMapWidget reads GlobalAlphaMask while it
+                    -- builds its tile brushes and never re-reads it (proven across probe
+                    -- v1.11 to v1.13: every setter sticks and none of them takes effect).
+                    -- So the mask has to be bound during Build. Once it is bound, the
+                    -- render target behind it is live -- redrawing its CONTENTS updates
+                    -- the fog with no property write and no rebuild, which is why only
+                    -- the on/off switch pays this cost and the radius does not.
+                    values = { false, true }, format = on_off, rebuild = true,
+                },
+                {
+                    key = "FogRevealMeters", label = "Reveal radius",
+                    -- Worth stating on the row itself: someone who finds the clear circle
+                    -- small at a wide Map range will otherwise read it as a bug.
+                    detail = "How far around you the fog clears, measured in real world distance. Zooming the map out does not uncover more, it only fits more fog on screen. Icons reveal slightly further out than the map does, so you can half make something out before you reach it.",
+                    values = FOG_REVEAL_VALUES, format = meters, apply = "fog",
+                    hidden = function(Config) return Config.FogEnabled == false end,
+                },
+                {
+                    -- v0.23.39. Her spec, 2026-09-17: "fully invisible 5m outside of my
+                    -- circle, starts fading the moment it hits the edge of my peek circle
+                    -- and its not in my trail circles." Asked whether to hard-code the 5,
+                    -- she chose a row so she can tune it in game.
+                    key = "FogMarkerFadeMeters", label = "Icon fade distance",
+                    detail = "How far past the reveal radius an icon keeps fading before it disappears. Icons inside the circle are fully visible, icons on your trail borrow that part of the trail's visibility, and everything else fades out across this distance. Zero cuts them off at the edge of the circle instead.",
+                    values = FOG_MARKER_FADE_VALUES, format = meters, apply = "fog",
+                    hidden = function(Config) return Config.FogEnabled == false end,
+                },
+
+                -- v0.23.3. The tab used to be one flat list of six rows, three of which
+                -- were sweeps left over from working out how the fog had to be built.
+                -- Now it reads as what it is: the two rows that decide what fog DOES,
+                -- then the rows that decide how it LOOKS, then the rig.
+                header("How it looks", function(Config) return Config.FogEnabled == false end),
+                {
+                    -- v0.23.3. Her request, 2026-09-17: "Don't forget about fog opacity
+                    -- too."
+                    --
+                    -- Render opacity on the fog layer, which is the lever already proven
+                    -- in this file -- Config.Opacity drives the whole minimap through
+                    -- SetRenderOpacity and has worked since v0.9. Live, one engine call,
+                    -- no rebuild, and nothing to read back wrong.
+                    --
+                    -- It touches the FOG layer only. The discovered ground is drawn by a
+                    -- separate layer above it, so turning fog down lightens the parts you
+                    -- have not been to and leaves the parts you have exactly alone.
+                    key = "FogOpacity", label = "Fog opacity",
+                    detail = "How much the fog hides. At 100% unexplored ground is covered completely. Lower it and the map underneath reads faintly through the fog, so you can still make out roughly where a corridor goes without it counting as explored. Ground you have already discovered is drawn over the top and never changes with this.",
+                    values = { 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00 },
+                    format = whole_percent_of, apply = "fog-opacity",
+                    hidden = function(Config) return Config.FogEnabled == false end,
+                },
+                {
+                    -- v0.23.5. Her idea, and the one fog feature that is a design rather
+                    -- than a mechanism. See Config/Runtime.lua and FOG_FEATURE_DESIGN.md,
+                    -- where her specification is quoted in full.
+                    key = "FogTrail", label = "Remember where you walked",
+                    detail = "Fog clears behind you as you walk, then comes back: quickly at first, so the fine detail goes within a few steps, and then slowly, so the route itself fades over a longer walk. It forgets by distance travelled rather than by time, so standing still to read the map neither erases your trail nor keeps it. Nothing is saved between sessions.",
+                    values = { false, true }, format = on_off, apply = "fog",
+                    hidden = function(Config) return Config.FogEnabled == false end,
+                },
+                {
+                    -- v0.23.5, her decision: its own row rather than a fraction of the
+                    -- reveal radius. See Config/Runtime.lua for why tying them together
+                    -- broke the moment the reveal radius moved.
+                    key = "FogTrailWidthMeters", label = "Trail width",
+                    detail = "How wide the cleared path behind you is, in real world distance. Match the peek keeps it the same width as the clear circle around you, so the path leaves the circle without stepping in. Any other value is a width of its own, and a width is somewhere you walked, so it does not change with how far the map is zoomed.",
+                    values = { 0, 4, 6, 8, 10, 12, 14, 18, 22, 28, 35, 45, 60 },
+                    -- 0 reads as "Match the peek" rather than "0 m", which would be a lie
+                    -- about what the row does. The formatter is the only place a player
+                    -- ever sees this value, and a diagnostic -- or a setting -- that
+                    -- misreports itself is the one thing this file keeps paying for.
+                    format = function(value)
+                        local v = tonumber(value) or 0
+                        if v <= 0 then return "Match the peek" end
+                        return meters(v)
+                    end,
+                    apply = "fog",
+                    hidden = function(Config)
+                        return Config.FogEnabled == false or Config.FogTrail == false
+                    end,
+                },
+                {
+                    key = "FogTrailMeters", label = "Trail memory",
+                    detail = "How far back your trail is remembered, measured in distance walked. Longer trails cost a little more to draw, so this is capped at what one redraw can afford at your current reveal radius.",
+                    values = { 25, 50, 75, 100, 150, 200, 250, 300, 400, 500, 750, 1000 },
+                    format = meters, apply = "fog",
+                    hidden = function(Config)
+                        return Config.FogEnabled == false or Config.FogTrail == false
+                    end,
+                },
+                {
+                    -- v0.20.3. The game's own map material animates its fog -- wind and a
+                    -- distortion texture, parameters and all -- and it does so on real
+                    -- time, which is why it keeps moving with the game paused. Those
+                    -- values are set for the full-screen world map; the minimap shows a
+                    -- fortieth of that world, so the same drift arrives about forty times
+                    -- faster relative to what is on screen. Gentle scales it back to the
+                    -- apparent speed the artists chose; Full is the raw setting.
+                    key = "FogMotion", label = "Fog motion",
+                    detail = "Whether the fog drifts. The game's own map fog moves; on a minimap that motion is magnified by how far the view is zoomed in, so Gentle slows it to match how it looks on the full world map. Full is the game's own speed, unscaled.",
+                    values = { "off", "gentle", "full" },
+                    format = function(value)
+                        local v = tostring(value)
+                        if v == "gentle" then return "Gentle" end
+                        if v == "full" then return "Full" end
+                        return "Off"
+                    end,
+                    apply = "fog-motion",
+                    hidden = function(Config) return Config.FogEnabled == false end,
+                },
+                {
+                    -- v0.19.9, and ADVANCED ONLY as of v0.23.3.
+                    --
+                    -- This row was never a preference. It exists because M_SpartaMapTile
+                    -- ships with its parameter list and no expression graph, so which end
+                    -- of RevealAmount masks could not be read out of the cooked asset,
+                    -- only swept for. That sweep was run against the SINGLE-layer design,
+                    -- where this material carried the discovery mask.
+                    --
+                    -- It does not any more. Since v0.23.0 the fog layer's mask is solid
+                    -- white and the discovery mask moved to the layer above, which pins
+                    -- its own RevealAmount at 1.0 on purpose. So what this row does to the
+                    -- picture NOW has not been measured, and a player-facing row whose
+                    -- effect cannot be described honestly is worse than one behind
+                    -- Advanced. It sits here until the sweep answers it, and then it is
+                    -- either described properly or deleted.
+                    key = "FogMaskStrength", label = "Mask strength",
+                    detail = "Advanced. Sets RevealAmount on the fog layer's material, which is how much of that layer's mask the game's map shader applies. Left over from working out which direction the shader masks in; what it changes in the current two layer fog has not been measured yet, so it is out of the way rather than described wrongly.",
+                    values = { 0.25, 0.40, 0.50, 0.60, 0.75, 0.90, 1.00 },
+                    format = function(value) return string.format("%.2f", tonumber(value) or 0) end,
+                    -- v0.19.10: rebuild, not live. Every parameter this mod has ever set
+                    -- on this widget after construction has stuck under readback and
+                    -- changed nothing on screen, so a live sweep was never going to be a
+                    -- fair test of anything. Each step costs a rebuild and is worth it.
+                    apply = "fog-mask", advanced = true,
+                    hidden = function(Config)
+                        return Config.FogEnabled == false or Config.AdvancedSettings ~= true
+                    end,
+                },
+
+                header("Testing", function(Config)
+                    return Config.FogEnabled == false or Config.AdvancedSettings ~= true
+                end),
+                {
+                    -- v0.19.3. Three builds have ended with "the mask is correct, it is
+                    -- bound, nothing happened on screen", and each one cost a round trip
+                    -- to answer a yes/no question. This row answers it in one test.
+                    --
+                    -- Advanced only, off by default, and it never ships as anything a
+                    -- player would meet by accident.
+                    --
+                    -- v0.23.3: every mode now has its own label. Five of the nine fell
+                    -- through to "Off" because the formatter was never extended past the
+                    -- first three, so three different diagnostics all read as switched
+                    -- off on the row that selects them -- which is the one place a
+                    -- diagnostic must not lie.
+                    key = "FogDiagnostic", label = "Fog diagnostic",
+                    detail = "For working out why fog is not appearing. Show the mask draws the fog layer's own mask over the minimap. Hide everything fills that mask solid. Masked map test draws the game's own fogged world painting through the mask using the game's own map material. Whole world shows the entire world map fogged by your own discovery mask, so every area's revealed holes can be checked at once without travelling to them. Mask black and Mask white force the mask to one value to prove which one fogs. View mask shows the cropped mask itself with no material in the way. No clear layer draws the fog layer alone, so what the layer above it contributes can be seen by its absence.",
+                    values = { "off", "show", "hide", "material", "world", "maskblack", "maskwhite", "viewmask", "nolayerb",
+                        "nolayers", "params", "composite", "blends", "readback" },
+                    format = function(value)
+                        local v = tostring(value)
+                        if v == "show" then return "Show the mask" end
+                        if v == "hide" then return "Hide everything" end
+                        if v == "material" then return "Masked map test" end
+                        if v == "world" then return "Whole world" end
+                        if v == "maskblack" then return "Mask black" end
+                        if v == "maskwhite" then return "Mask white" end
+                        if v == "viewmask" then return "View mask" end
+                        if v == "nolayers" then return "No fog layers" end
+                        if v == "params" then return "Dump material params" end
+                        if v == "composite" then return "Our own composite" end
+                        if v == "blends" then return "Blend mode probe" end
+                        if v == "nolayerb" then return "No clear layer" end
+                        -- v0.23.47. Added in v0.23.45 to the values list and NOT here, so
+                        -- it cycled through displaying "Off" -- a value showing as its own
+                        -- opposite, which is worse than a missing one because it reads as
+                        -- proof the option does not exist. She reported exactly that.
+                        if v == "readback" then return "Mask readback probe" end
+                        return "Off"
+                    end,
+                    rebuild = true, advanced = true,
+                    hidden = function(Config)
+                        return Config.FogEnabled == false or Config.AdvancedSettings ~= true
+                    end,
+                },
+            },
+        },
+        {
             key = "ICONS", label = "ICONS",
             settings = {
                 header("Map icons"),
@@ -613,7 +838,7 @@ function Factory.New(categories, local_categories, local_art, label_art)
                 {
                     key = "LocalInteractableIconSize", label = "Base icon size",
                     detail = "Size every local marker is measured from. Each category below multiplies this number by its own percentage, so this row moves the whole set together and the per-category rows move one kind at a time.",
-                    values = ICON_SIZE_VALUES, format = pixels, apply = "local-presentation",
+                    values = LOCAL_ICON_SIZE_VALUES, format = pixels, apply = "local-presentation",
                 },
                 {
                     key = "LocalInteractableBudget", label = "Local icon budget", hidden = advanced_hidden,
@@ -795,10 +1020,50 @@ function Factory.New(categories, local_categories, local_art, label_art)
                     values = { false, true }, format = on_off,
                 },
                 {
+                    -- v0.23.43, from the performance audit. These breadcrumbs found three
+                    -- crashes and then kept costing 766 prints a second on the pose path,
+                    -- which is invariant 0l pointed at my own instrument. Its own row so
+                    -- the cheap traces can stay on without them, and OFF by default so
+                    -- nobody pays for a hunt that is finished.
+                    hidden = advanced_hidden, key = "TraceHotPaths", label = "Trace hot paths",
+                    detail = "Write a log line for every step of the fog view crop, the player pose update and the dungeon capture. Only useful for tracking down a crash, and expensive: on a recent session these were 71 percent of all logging. The cheaper traces are unaffected by this row.",
+                    values = { false, true }, format = on_off,
+                },
+                {
+                    -- v0.23.56, and it existed for weeks with NO WAY TO TURN IT OFF.
+                    --
+                    -- She asked "is anything running that shouldn't" at 77 fps. This was:
+                    -- 200,634 of her 219,417 log lines, 364 writes a second on the game
+                    -- thread, left on from a crash hunt that is now closed. It had a
+                    -- config key, an ini line and a default of false -- and no row, so the
+                    -- only way to stop it was to close the game and edit the ini.
+                    --
+                    -- A diagnostic a player can turn on and cannot turn off is a trap. It
+                    -- goes beside the two rows that always had one.
+                    hidden = advanced_hidden, key = "LocalDiscoveryTrace",
+                    label = "Trace discovery",
+                    detail = "Write a log line for every tick stage and every step of the local-discovery hooks. It names the last thing that ran before a crash, which is what it is for. Expensive: on a recent session it was 91 percent of all logging, around 364 writes a second. Leave it off unless a crash is being chased.",
+                    values = { false, true }, format = on_off,
+                },
+                {
                     key = "LogPerformance", label = "Log performance",
                     hidden = advanced_hidden,
                     detail = "Every 10 s, write [PERF] lines with CPU time and call counts for each minimap system to the UE4SS log. Also turns on the shared UI host's logging. Ctrl+Delete writes one immediately.",
                     values = { false, true }, format = on_off, apply = "perf",
+                },
+                {
+                    -- v0.23.3. Advanced, and it exists because of a measurement rather
+                    -- than a preference: 4935 of the 8715 ms between a map load and a
+                    -- finished minimap are this timer waiting. See Config/Runtime.lua for
+                    -- the full timeline. The shipped default is unchanged at 5.0 s and
+                    -- moves only when a sweep says where the floor is.
+                    key = "WorldReleaseSettleMs", label = "Load settle",
+                    hidden = advanced_hidden,
+                    detail = "How long the minimap waits after a map finishes loading before it starts building itself. The wait is there so it never reads a world that is still assembling. Lowering it makes the minimap and its icons appear sooner after a load; too low and it may fail to build, or crash. 5.0 s is the value this mod has always used. Takes effect at the next load.",
+                    values = { 250, 500, 750, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000 },
+                    format = function(value)
+                        return string.format("%.2f s", (tonumber(value) or 0) / 1000.0)
+                    end,
                 },
                 header("Advanced"),
                 {

@@ -21,6 +21,8 @@ function Factory.New(ctx)
     local Classifier = assert(ctx.LocalClassifier, "Overlay.LocalPool requires Local.Classifier")
     local WorkBudget = assert(ctx.WorkBudget, "Overlay.LocalPool requires Runtime.WorkBudget")
     local log = assert(ctx.Log, "Overlay.LocalPool requires Log")
+    -- Core/Timeline.lua, soft (see Runtime/Lifecycle.lua for why).
+    local Timeline = ctx.Timeline or { Stamp = function() end }
     local Perf = type(ctx.Perf) == "table" and ctx.Perf
         or { Begin = function() return nil end, End = function() end, Count = function() end }
 
@@ -49,7 +51,20 @@ function Factory.New(ctx)
     local POSITION_EPSILON_SQ = 0.001 * 0.001
     local CONSTRUCTION_BATCH = 4
     local CONSTRUCTION_DELAY_MS = 50
-    local ASSET_DELAY_MS = 30
+    -- v0.23.4: a BUDGET, not a fixed one-per-timer. Measured on her machine, the local
+    -- sweep cost 244 ms over 30 scheduled steps -- 8 ms of work per step and 30 ms of
+    -- waiting between them, so nearly a second of wall clock to resolve 45 textures that
+    -- together cost a quarter of that. The delay was sized for the worst case (a texture
+    -- that needs a disk load) and paid on every case, including the resident ones that
+    -- take a fraction of a millisecond.
+    --
+    -- Now each step keeps resolving until it has spent ASSET_BUDGET_MS, then yields for
+    -- one frame instead of one-and-a-half. Residents fly through many per step; a real
+    -- load takes its step alone and yields immediately after. Same per-frame ceiling,
+    -- roughly half the wall clock, and it self-tunes to her machine rather than to a
+    -- number somebody picked.
+    local ASSET_DELAY_MS = 16
+    local ASSET_BUDGET_MS = 8.0
     local RESELECT_MOVE_EPSILON_SQ = 1000.0 * 1000.0 -- 10 m; primitive-only reselection
 
     state.local_pool = state.local_pool or {
@@ -104,14 +119,27 @@ function Factory.New(ctx)
     -- Per-category multiplier on the shared marker size. `LocalInteractableIconSize`
     -- is one number for every local icon, which is what the user ran into when
     -- shrinking bear traps shrank everything; this is the per-icon dimension.
+    -- MEMOIZED, like category_art twelve lines below and invalidated by the same hook.
+    -- v0.23.4.
+    --
+    -- This runs from update_entry, which is once per VISIBLE marker per pose tick. The
+    -- budget is 64 markers and the tick is 30 Hz, so `"LocalIconScale" .. key` was
+    -- allocating and hashing a fresh string roughly 1900 times a second inside tick.local
+    -- -- already the largest single section in the mod's baseline -- for a value that
+    -- changes only when a setting is written. There are about ten categories.
+    local scale_cache = {}
     local function category_scale(category)
         local key = tostring(category or "")
+        local cached = scale_cache[key]
+        if cached ~= nil then return cached end
         local override = tonumber(Config["LocalIconScale" .. key])
         local scale = override
         if scale == nil and type(Classifier.CategoryScale) == "function" then
             scale = Classifier.CategoryScale(key)
         end
-        return math.max(0.25, math.min(2.0, tonumber(scale) or 1.0))
+        local value = math.max(0.25, math.min(2.0, tonumber(scale) or 1.0))
+        scale_cache[key] = value
+        return value
     end
 
     -- v0.17.0: the art a category draws with comes from the LOCAL tab's icon and
@@ -136,7 +164,9 @@ function Factory.New(ctx)
         art_cache[key] = cached
         return cached
     end
-    local function invalidate_art() art_cache = {} end
+    -- Both caches, from the one hook that already existed. A settings write is the only
+    -- thing that can change either of them.
+    local function invalidate_art() art_cache = {}; scale_cache = {} end
 
     local function plates_enabled()
         return Config.LocalIconPlates == true and pool.asset_ok[Classifier.PlateIconPath] == true
@@ -170,6 +200,26 @@ function Factory.New(ctx)
     -- threshold; FadeStart at it; down to FadeMin over FadeRange metres beyond it;
     -- FadeMin from there on. Quantised to whole percent so a marker that drifts a
     -- few centimetres does not rewrite its opacity every frame.
+    -- WHAT THE FOG LETS THIS MARKER BE SEEN AT. v0.23.39.
+    --
+    -- Her rule: "Local stuff can't be discovered, and it is bound by reveal distance and
+    -- my trail circles." So every local marker -- enemies, items, interactables,
+    -- decorations -- is sight-only, and the fog layer owns the number.
+    --
+    -- 1.0 when fog is off, suppressed in a dungeon, or the layer is unavailable, so
+    -- nothing here changes for a player with fog off.
+    local function fog_visibility(world_x, world_y)
+        if type(ctx.Fog) ~= "table" or type(ctx.Fog.MarkerVisibility) ~= "function" then
+            return 1.0
+        end
+        local ok, value = pcall(ctx.Fog.MarkerVisibility, world_x, world_y)
+        if not ok then return 1.0 end
+        value = tonumber(value)
+        if value == nil then return 1.0 end
+        if value < 0.0 then return 0.0 elseif value > 1.0 then return 1.0 end
+        return value
+    end
+
     local function height_fade(delta_abs)
         if Config.LocalHeightFade == false or delta_abs == nil then return 1.0 end
         local threshold = height_threshold()
@@ -215,6 +265,17 @@ function Factory.New(ctx)
     end
 
     local function find_object(path)
+        -- v0.23.4: /Script/ paths come from the shared memo in Core/Object.lua. Engine
+        -- classes and CDOs live for the process, are not part of any world and are not
+        -- touched by LoadMap, so they are the one thing this codebase is allowed to hold
+        -- across a world change -- and they were being resolved once per module.
+        -- "/Script/UMG.Image" alone was found eight times in a single build, at about
+        -- 3 ms a call. The memo validates on the way out, so a stale entry misses and
+        -- re-finds rather than handing back a dead wrapper. Everything else is unchanged.
+        if type(Object.FindEngineClass) == "function" then
+            local memoized = Object.FindEngineClass(path, Perf, "native.find")
+            if memoized ~= nil then return memoized end
+        end
         local token = Perf.Begin()
         local ok, value = pcall(StaticFindObject, path)
         Perf.End("native.find", token)
@@ -398,7 +459,29 @@ function Factory.New(ctx)
             refs.slot = slot
             slot:SetPosition({ X = -10000, Y = -10000 })
             slot:SetSize({ X = 1, Y = 1 })
-            pcall(slot.SetZOrder, slot, kind == "plate" and 3 or 5)
+            -- ABOVE THE FOG. v0.23.31.
+            --
+            -- HER REPORT: "I can't see icons inside of my peek hole or trail behind me,
+            -- like enemies, items, etc. poi markers and local markers both. The only icon
+            -- i do see rendered is the height indicator."
+            --
+            -- She is right and the Z orders say so plainly. The fog is layer A at 4 and
+            -- layer B at 5 (Map/NativeWidget.lua), and these markers were sitting at 3, 4
+            -- and 5 -- level with the fog or beneath it. Fog became default-ON in v0.23.x
+            -- and quietly buried every marker with it; the height chevrons survived only
+            -- because they happened to be parented higher.
+            --
+            -- Markers belong ON TOP of the fog, which is also her instruction: "they can
+            -- sit on top like the elevation arrows do". What a marker means -- here is a
+            -- thing, and how far away it is -- is not something fog should be able to
+            -- swallow. Whether a marker should DIM with fog depth is a separate question
+            -- and a separate change; this one only stops them being hidden outright.
+            --
+            -- Kept below Z_ARROW (10) so the player marker still wins, and below the
+            -- labels (59/60) which have always drawn above everything.
+            -- The plate stays one below its icon so the icon still reads on top
+            -- of its own backing, and both clear the fog.
+            pcall(slot.SetZOrder, slot, kind == "plate" and 7 or 8)
             image:SetVisibility(VIS_COLLAPSED)
             image:SetBrushFromTexture(texture, false)
         end)
@@ -439,16 +522,49 @@ function Factory.New(ctx)
     end
 
     -- Centre-anchored placement for a decoration, aspect-fitted like the markers.
+    -- Sub-pixel: two placements closer together than this are the same placement to the
+    -- eye and to the renderer, so writing the second one is two engine calls for nothing.
+    local DECORATION_EPSILON = 0.05
+
     local function place_decoration(refs, center_x, center_y, box, angle)
         if refs == nil or not valid(refs.slot) then return false end
         local nw = tonumber(refs.native_w) or 1
         local nh = tonumber(refs.native_h) or 1
         local longest = math.max(nw, nh)
         local w, h = box * nw / longest, box * nh / longest
+        local x, y = center_x - w / 2.0, center_y - h / 2.0
+
+        -- MEMOIZED, like the icon above it. v0.23.4.
+        --
+        -- update_decorations is reached whenever a marker moved, and UpdateRecordPosition
+        -- clears last_x/last_y on purpose so a moving marker defeats the icon's own
+        -- position skip -- which is right for the icon and was being paid by the plate as
+        -- well. A static interactable hits the skip and costs nothing here; an ENEMY, five
+        -- refreshes a second at 30 Hz, was paying a SetSize and a SetPosition on the plate
+        -- every tick it moved. That is the per-marker difference between exploring and
+        -- fighting, inside the section that is already the largest in the mod.
+        --
+        -- refs.size_value and refs.position_value are persistent tables that already hold
+        -- what was last written, so the comparison is free and needs no new state.
+        local same = refs.placed == true
+            and math.abs((tonumber(refs.size_value.X) or -1) - w) < DECORATION_EPSILON
+            and math.abs((tonumber(refs.size_value.Y) or -1) - h) < DECORATION_EPSILON
+            and math.abs((tonumber(refs.position_value.X) or -1) - x) < DECORATION_EPSILON
+            and math.abs((tonumber(refs.position_value.Y) or -1) - y) < DECORATION_EPSILON
+        if same then
+            if angle ~= nil and refs.angle ~= angle then
+                if pcall(refs.image.SetRenderTransformAngle, refs.image, angle) then
+                    refs.angle = angle
+                end
+            end
+            return true
+        end
+
         refs.size_value.X, refs.size_value.Y = w, h
-        refs.position_value.X, refs.position_value.Y = center_x - w / 2.0, center_y - h / 2.0
+        refs.position_value.X, refs.position_value.Y = x, y
         local ok = pcall(refs.slot.SetSize, refs.slot, refs.size_value)
             and pcall(refs.slot.SetPosition, refs.slot, refs.position_value)
+        refs.placed = ok
         if ok and angle ~= nil and refs.angle ~= angle then
             if pcall(refs.image.SetRenderTransformAngle, refs.image, angle) then
                 refs.angle = angle
@@ -481,7 +597,27 @@ function Factory.New(ctx)
             trace("construct-slot", "index=" .. tostring(index))
             slot:SetPosition({ X = -10000, Y = -10000 })
             slot:SetSize({ X = 1, Y = 1 })
-            pcall(slot.SetZOrder, slot, 4)
+            -- ABOVE THE FOG. v0.23.31.
+            --
+            -- HER REPORT: "I can't see icons inside of my peek hole or trail behind me,
+            -- like enemies, items, etc. poi markers and local markers both. The only icon
+            -- i do see rendered is the height indicator."
+            --
+            -- She is right and the Z orders say so plainly. The fog is layer A at 4 and
+            -- layer B at 5 (Map/NativeWidget.lua), and these markers were sitting at 3, 4
+            -- and 5 -- level with the fog or beneath it. Fog became default-ON in v0.23.x
+            -- and quietly buried every marker with it; the height chevrons survived only
+            -- because they happened to be parented higher.
+            --
+            -- Markers belong ON TOP of the fog, which is also her instruction: "they can
+            -- sit on top like the elevation arrows do". What a marker means -- here is a
+            -- thing, and how far away it is -- is not something fog should be able to
+            -- swallow. Whether a marker should DIM with fog depth is a separate question
+            -- and a separate change; this one only stops them being hidden outright.
+            --
+            -- Kept below Z_ARROW (10) so the player marker still wins, and below the
+            -- labels (59/60) which have always drawn above everything.
+            pcall(slot.SetZOrder, slot, 8)
             trace("construct-visibility", "index=" .. tostring(index))
             image:SetVisibility(VIS_COLLAPSED)
             trace("construct-done", "index=" .. tostring(index))
@@ -579,7 +715,18 @@ function Factory.New(ctx)
             set_decoration_visible(item.refs.chevron, false)
         end
         -- v0.18.1: icon, plate and chevron fade together past the threshold.
-        set_item_opacity(item, opacity)
+        -- v0.23.39: and the fog multiplies whatever the height rule decided. Her answer
+        -- on the height arrows was "height markers opacity should always always be linked
+        -- to their icon", which is already true here -- set_item_opacity writes the icon,
+        -- the plate and the chevron from one number -- so the fog only has to reach this
+        -- one line to satisfy it.
+        -- Remembered so the position-skip path below can re-apply the product without
+        -- recomputing the height rule. THE PLAYER moves even when a marker's screen
+        -- position does not, so fog visibility changes on frames where nothing else here
+        -- would run -- and a marker frozen at the opacity it had ten metres ago is the
+        -- whole bug this line exists to avoid.
+        item.height_opacity = opacity
+        set_item_opacity(item, opacity * (item.fog_visibility or 1.0))
     end
 
     local function update_entry(item, player_x, player_y, context, size, radius_sq)
@@ -587,8 +734,21 @@ function Factory.New(ctx)
         if type(target) ~= "table" then return true end
         pool.metrics.entries_examined = pool.metrics.entries_examined + 1
         local dx, dy = target.x - player_x, target.y - player_y
+
         if radius_sq ~= nil and dx * dx + dy * dy > radius_sq then
             pool.metrics.broad_phase_rejects = pool.metrics.broad_phase_rejects + 1
+            set_visible(item, false)
+            hide_decorations(item)
+            return true
+        end
+        -- FOG CULLS BEFORE THE PROJECTION. v0.23.39. A marker the fog hides costs one
+        -- distance test and nothing else -- no projection, no size write, no decoration
+        -- work -- which is what keeps a rule that touches every local marker cheap.
+        -- Stored on the item because update_decorations, several calls down, is where the
+        -- opacity is finally written and it has no world position of its own.
+        item.fog_visibility = fog_visibility(target.x, target.y)
+        if item.fog_visibility <= 0.0 then
+            pool.metrics.fog_hidden = (pool.metrics.fog_hidden or 0) + 1
             set_visible(item, false)
             hide_decorations(item)
             return true
@@ -620,6 +780,10 @@ function Factory.New(ctx)
         local ddy = item.last_y ~= nil and y - item.last_y or 0.0
         if item.last_x ~= nil and ddx * ddx + ddy * ddy < POSITION_EPSILON_SQ then
             pool.metrics.position_skips = pool.metrics.position_skips + 1
+            -- The marker has not moved on screen, but the fog around it may have. One
+            -- multiply and a compare: write_opacity returns early on a value it already
+            -- holds, so a standing-still frame still costs nothing.
+            set_item_opacity(item, (item.height_opacity or 1.0) * item.fog_visibility)
             return set_visible(item, true)
         end
         item.position_value.X, item.position_value.Y = x, y
@@ -647,6 +811,19 @@ function Factory.New(ctx)
         context = context or Projection.Prepare(Config.Size, Config.ZoomMeters,
             state.map_rotation_angle, Config.MapShape, Config.EdgeVisibility)
         if type(context) ~= "table" then return false end
+
+        -- v0.23.4: the relevance radius and centre are recorded HERE, before any of the
+        -- early returns below, because UpdateRecordPosition needs them on every pass and
+        -- not only on the passes that reach the visible update. The first version put
+        -- them next to the loop that uses them, and the reselection branch returns above
+        -- that point -- so the radius was never known, every record looked like a change,
+        -- and the gate this exists for did nothing. The suite caught it.
+        local size = marker_size()
+        local radius_sq = Projection.RelevantRadiusSquared(
+            context, size * math.sqrt(2.0) / 2.0, false, 0)
+        pool.last_radius_sq = radius_sq
+        pool.last_center_x, pool.last_center_y = player_x, player_y
+
         if not pool.reselecting and pool.selection_center_x ~= nil
             and type(ctx.LocalDiscovery) == "table"
             and type(ctx.LocalDiscovery.Records) == "function" then
@@ -665,9 +842,9 @@ function Factory.New(ctx)
         if pool.active_count <= 0 then return true end
         local sample = pool.metrics.update_runs % 120 == 1
         local started = sample and os.clock() or nil
-        local size = marker_size()
-        local radius_sq = Projection.RelevantRadiusSquared(
-            context, size * math.sqrt(2.0) / 2.0, false, 0)
+        -- size and radius_sq are computed once above, before the early returns, and are
+        -- the same numbers UpdateRecordPosition answers from -- so the two can never
+        -- disagree about where the boundary is.
         local success = true
         for index, item in ipairs(pool.entries) do
             if item.target ~= nil then
@@ -719,6 +896,24 @@ function Factory.New(ctx)
             trace("build-construct", "n=" .. tostring(built))
             local item, err = construct_entry()
             if item == nil then
+                -- v0.23.5. THE SAME BUG THE OBJECTIVE POOL HAD, in the same shape, found
+                -- in her log the moment that one was fixed:
+                --   "Local interactable pool construction stopped:
+                --    renderer-frame-or-image-class-unavailable"
+                --
+                -- construct_entry reports that while the widget tree is mid-rebuild --
+                -- Build() replaces state.retained.frame wholesale at its END, so for that
+                -- moment there is nothing to parent an Image to. Transient. Latching
+                -- build_blocked on it removed every local marker for the rest of the
+                -- session, because build_blocked is cleared only by a world change.
+                --
+                -- Two pools, two copies of the same construction loop, one bug each. The
+                -- objective pool's copy was found by three screenshots with no icons; this
+                -- one was found by reading the log line directly underneath it.
+                if err == "renderer-frame-or-image-class-unavailable" then
+                    pool.metrics.build_deferrals = (pool.metrics.build_deferrals or 0) + 1
+                    break
+                end
                 pool.build_blocked = true
                 pool.metrics.build_failures = pool.metrics.build_failures + 1
                 log("Local interactable pool construction stopped: " .. tostring(err))
@@ -731,6 +926,9 @@ function Factory.New(ctx)
             end
             built = built + 1
             pool.metrics.images_constructed = pool.metrics.images_constructed + 1
+            -- The last stage of a normal load: once a local marker is on screen the
+            -- minimap is doing everything it does, and Core/Timeline.lua writes its line.
+            Timeline.Stamp("local_first_icon")
         end
         trace("build-assigned", "built=" .. tostring(built))
         local elapsed = (os.clock() - started) * 1000.0
@@ -838,19 +1036,69 @@ function Factory.New(ctx)
         end, "local.sync")
     end
 
+    -- Returns: did a live marker move, and COULD the selection have changed.
+    --
+    -- v0.23.4, and this is the combat one. Local/Discovery.lua used to ask for a full
+    -- re-selection every time any enemy moved five metres. SyncRecords is a pairs() walk
+    -- over every record, a fresh target table per eligible one, a table.sort whose
+    -- tie-break calls tostring on both sides, a desired table, a free table and two walks
+    -- of the entries -- and request_sync coalesces onto a 100 ms schedule, so in a fight,
+    -- where something always moves five metres inside 100 ms, the ceiling IS the steady
+    -- state. Ten full re-selections a second, inside the section that is already the
+    -- largest in the mod.
+    --
+    -- Moving does not change WHICH records are eligible. The only position-dependent test
+    -- in eligible_target is the range radius, so the selection can only change when a
+    -- record CROSSES that boundary -- or when the pool is full, where the distance
+    -- ordering decides who gets the last slots. Everything else is handled by the in-place
+    -- update below, which allocates nothing.
+    --
+    -- Exploration never hit this because static interactables do not move.
     function pool.UpdateRecordPosition(record)
-        if type(record) ~= "table" or record.id == nil then return false end
+        if type(record) ~= "table" or record.id == nil then return false, false end
+
+        local may_change = false
+        local radius_sq = tonumber(pool.last_radius_sq)
+        if radius_sq ~= nil then
+            local cx, cy = tonumber(pool.last_center_x), tonumber(pool.last_center_y)
+            local rx, ry = tonumber(record.x), tonumber(record.y)
+            if cx ~= nil and cy ~= nil and rx ~= nil and ry ~= nil then
+                local dx, dy = rx - cx, ry - cy
+                local in_range = (dx * dx + dy * dy) <= radius_sq
+                if record.pool_in_range ~= in_range then
+                    record.pool_in_range = in_range
+                    may_change = true
+                end
+            else
+                -- No usable geometry yet: say yes rather than silently never syncing.
+                may_change = true
+            end
+        else
+            may_change = true
+        end
+        -- At capacity the distance ordering decides which records get the last slots, so
+        -- movement inside the radius really can change the selection.
+        --
+        -- active_count, NOT #pool.entries: entries is every Image widget ever built and
+        -- they are pooled and reused, so it reaches capacity and stays there while most of
+        -- them sit free. Testing it meant "always contended", which made this whole gate a
+        -- no-op -- and the suite caught exactly that.
+        if not may_change and (tonumber(pool.active_count) or 0) >= capacity() then
+            may_change = true
+        end
+
         local item = pool.by_record[record.id]
-        if type(item) ~= "table" or type(item.target) ~= "table" then return false end
+        if type(item) ~= "table" or type(item.target) ~= "table" then return false, may_change end
         item.target.x, item.target.y = tonumber(record.x), tonumber(record.y)
         item.last_x, item.last_y = nil, nil
-        return true
+        return true, may_change
     end
 
     local function resolve_assets_step(paths, index, token, epoch)
         if token ~= pool.build_token or epoch ~= state.lifecycle_epoch
             or state.world_quarantined then return end
         if index > #paths then
+            Timeline.Stamp("local_assets")
             pool.ready = pool.asset_ok[Classifier.GenericIconPath] == true
             pool.dependency_started = false
             if pool.ready then
@@ -883,6 +1131,16 @@ function Factory.New(ctx)
     end
 
     function pool.OnRendererReady()
+        -- v0.23.5: a NEW widget tree, so whatever blocked construction against the old one
+        -- says nothing about this one. Cleared BEFORE the early return, because on a
+        -- rebuild `ready` is already true and the early return is the path that runs.
+        if pool.build_blocked then
+            pool.build_blocked = false
+            pool.metrics.build_unblocks = (pool.metrics.build_unblocks or 0) + 1
+            log("Local interactable pool construction unblocked by a fresh widget tree; "
+                .. tostring(#pool.pending_targets) .. " marker(s) still pending")
+        end
+        if pool.ready and #pool.pending_targets > 0 then arm_pending_build() end
         if pool.dependency_started or pool.ready then return true end
         local frame = state.retained and state.retained.frame or nil
         if not state.built or not valid(frame) then return false end
